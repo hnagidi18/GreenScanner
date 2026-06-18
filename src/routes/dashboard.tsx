@@ -2,9 +2,8 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Leaf, Upload, Image as ImageIcon, Droplets, Sprout, BarChart3,
-  TrendingDown, Grid3x3, ArrowLeft, Loader2, Sparkles, RotateCcw, Sliders,
+  TrendingDown, Grid3x3, ArrowLeft, Loader2, Sparkles,
 } from "lucide-react";
-import { Slider } from "@/components/ui/slider";
 
 export const Route = createFileRoute("/dashboard")({
   head: () => ({
@@ -28,13 +27,6 @@ type Result = {
   segmentedUrl: string;
 };
 
-type Settings = {
-  sensitivity: number;   // 0-100, weed detection aggressiveness
-  minPatch: number;      // 5-300 px, min connected weed cluster size
-  strength: number;      // 0-100, overlay opacity / segmentation crispness
-};
-
-const RECOMMENDED: Settings = { sensitivity: 50, minPatch: 30, strength: 55 };
 const BASE_DOSE = 10;
 
 function morph(mask: Uint8Array, w: number, h: number, op: "erode" | "dilate", iters = 1) {
