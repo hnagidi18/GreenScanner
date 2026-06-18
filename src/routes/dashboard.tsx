@@ -129,145 +129,227 @@ async function processImage(file: File, settings: Settings): Promise<Result> {
   const src = ctx.getImageData(0, 0, w, h);
   const N = w * h;
 
-  // Map settings (0-100) to physical thresholds.
   const sens = settings.sensitivity / 100;        // 0..1
   const strength = settings.strength / 100;       // 0..1
-  // Score threshold: higher sensitivity → fewer cues required.
-  // sens 0   -> 4 cues, sens 0.5 -> 2 cues, sens 1 -> 1 cue
-  const scoreNeeded = sens > 0.8 ? 1 : sens > 0.4 ? 2 : sens > 0.15 ? 3 : 4;
-  // Cue thresholds also widen with sensitivity slightly.
-  const hueCut = 65 + sens * 15;                  // 65..80
-  const satCut = 0.40 + sens * 0.15;              // 0.40..0.55
-  const valCut = 0.60 - sens * 0.10;              // 0.60..0.50
-  const varCut = 450 - sens * 200;                // 450..250
 
-  // Step 1: Excess-Green vegetation mask with adaptive threshold.
-  const exg = new Int16Array(N);
-  let exgMin = 1e9, exgMax = -1e9;
+  // ---------- Step 1: Excess-Green per pixel ----------
+  const exg = new Float32Array(N);
+  let exgSum = 0;
   for (let p = 0; p < N; p++) {
     const i = p * 4;
     const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
     const v = 2 * g - r - b;
     exg[p] = v;
-    if (v < exgMin) exgMin = v;
-    if (v > exgMax) exgMax = v;
+    exgSum += v;
   }
-  // Strength tightens vegetation threshold (cleaner soil separation).
-  const exgFloor = 12 + strength * 12;            // 12..24
-  const exgThresh = Math.max(exgFloor, Math.round((exgMax - exgMin) * 0.18) + Math.min(0, exgMin));
+  const exgMean = exgSum / N;
+  let varAcc = 0;
+  for (let p = 0; p < N; p++) { const d = exg[p] - exgMean; varAcc += d * d; }
+  const exgStd = Math.sqrt(varAcc / N) || 1;
+
+  // ---------- Step 2: adaptive vegetation threshold ----------
+  // Higher sensitivity → slightly lower threshold (more vegetation).
+  const baseThr = Math.max(10, exgMean + (0.25 - sens * 0.15) * exgStd);
+  const fracAt = (t: number) => { let c = 0; for (let p = 0; p < N; p++) if (exg[p] > t) c++; return c / N; };
+  let thr = baseThr;
+  let frac = fracAt(thr);
+  // Keep vegetation between 3% and 88% so output is never one solid color.
+  let guard = 0;
+  while (frac > 0.88 && guard++ < 40) { thr += Math.max(2, exgStd * 0.1); frac = fracAt(thr); }
+  guard = 0;
+  while (frac < 0.03 && guard++ < 40) { thr -= Math.max(2, exgStd * 0.1); frac = fracAt(thr); }
+
   const veg = new Uint8Array(N);
-  for (let p = 0; p < N; p++) veg[p] = exg[p] > exgThresh ? 1 : 0;
+  for (let p = 0; p < N; p++) veg[p] = exg[p] > thr ? 1 : 0;
 
-  // Step 2: Noise removal — open. Stronger setting = stronger cleanup.
-  const openIters = strength > 0.66 ? 2 : 1;
-  let cleaned = morph(veg, w, h, "erode", openIters);
-  cleaned = morph(cleaned, w, h, "dilate", openIters);
+  // Light morphological opening to clean speckles, keep crop rows intact.
+  let cleaned = morph(veg, w, h, "erode", 1);
+  cleaned = morph(cleaned, w, h, "dilate", 1);
 
-  const { labels, sizes } = connectedComponents(cleaned, w, h);
-  // Tiny isolated vegetation blobs are almost always weeds.
-  const weedMaxSize = Math.max(40, Math.floor(N * (0.002 + sens * 0.004)));
   let vegTotal = 0;
   for (let p = 0; p < N; p++) if (cleaned[p]) vegTotal++;
 
-  // Step 3: per-pixel weed score on vegetation (HSV + local ExG texture).
-  const weedPixel = new Uint8Array(N);
-  const R = 2;
+  // ---------- Step 3: connected components + bounding boxes ----------
+  const { labels, sizes } = connectedComponents(cleaned, w, h);
+  const NC = sizes.length;
+  const minX = new Int32Array(NC); const maxX = new Int32Array(NC);
+  const minY = new Int32Array(NC); const maxY = new Int32Array(NC);
+  for (let id = 0; id < NC; id++) { minX[id] = w; minY[id] = h; maxX[id] = 0; maxY[id] = 0; }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const id = labels[y * w + x];
+      if (!id) continue;
+      if (x < minX[id]) minX[id] = x;
+      if (x > maxX[id]) maxX[id] = x;
+      if (y < minY[id]) minY[id] = y;
+      if (y > maxY[id]) maxY[id] = y;
+    }
+  }
+
+  // ---------- Step 4: row detection via column histogram ----------
+  // Crops typically sit in vertical rows; project vegetation along columns
+  // and again along rows so we detect whichever orientation dominates.
+  const colHist = new Int32Array(w);
+  const rowHist = new Int32Array(h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (cleaned[y * w + x]) { colHist[x]++; rowHist[y]++; }
+    }
+  }
+  const smoothLine = (arr: Int32Array, len: number, radius: number) => {
+    const out = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      let s = 0, c = 0;
+      const a = Math.max(0, i - radius), b = Math.min(len - 1, i + radius);
+      for (let k = a; k <= b; k++) { s += arr[k]; c++; }
+      out[i] = s / c;
+    }
+    return out;
+  };
+  const SR = Math.max(2, Math.round(Math.min(w, h) * 0.012));
+  const colS = smoothLine(colHist, w, SR);
+  const rowS = smoothLine(rowHist, h, SR);
+  const meanStd = (arr: Float32Array) => {
+    let m = 0; for (let i = 0; i < arr.length; i++) m += arr[i]; m /= arr.length;
+    let v = 0; for (let i = 0; i < arr.length; i++) { const d = arr[i] - m; v += d * d; }
+    return { m, s: Math.sqrt(v / arr.length) };
+  };
+  const cs = meanStd(colS), rs = meanStd(rowS);
+  // Whichever axis has stronger variance is the "across rows" axis (rows are perpendicular).
+  const colVariation = cs.s / (cs.m || 1);
+  const rowVariation = rs.s / (rs.m || 1);
+  const useCols = colVariation >= rowVariation;
+  const lineArr = useCols ? colS : rowS;
+  const lineLen = useCols ? w : h;
+  const lineStat = useCols ? cs : rs;
+  const rowCut = lineStat.m + 0.15 * lineStat.s;
+  const inRow = new Uint8Array(lineLen);
+  for (let i = 0; i < lineLen; i++) inRow[i] = lineArr[i] >= rowCut ? 1 : 0;
+
+  // ---------- Step 5: classify components ----------
+  // crop = large, row-aligned. weed = small / isolated / off-row patches.
+  const cropMinSize = Math.max(
+    settings.minPatch * 4,
+    Math.floor(N * (0.0035 - sens * 0.002)), // 0.0015..0.0035 fraction
+  );
+  // 0=unused, 1=crop, 2=weed
+  const compClass = new Uint8Array(NC);
+  for (let id = 1; id < NC; id++) {
+    const s = sizes[id];
+    if (s === 0) { continue; }
+    const bw = maxX[id] - minX[id] + 1;
+    const bh = maxY[id] - minY[id] + 1;
+    const fill = s / (bw * bh);
+    // How much of the component's bbox sits inside detected crop rows.
+    let rowHit = 0, rowAll = 0;
+    if (useCols) {
+      for (let x = minX[id]; x <= maxX[id]; x++) { rowAll++; if (inRow[x]) rowHit++; }
+    } else {
+      for (let y = minY[id]; y <= maxY[id]; y++) { rowAll++; if (inRow[y]) rowHit++; }
+    }
+    const rowOverlap = rowAll ? rowHit / rowAll : 0;
+    // Elongation along the row direction is another crop cue.
+    const elong = useCols ? bh / Math.max(1, bw) : bw / Math.max(1, bh);
+
+    const looksLikeCrop =
+      s >= cropMinSize &&
+      (rowOverlap >= 0.45 || elong >= 1.6 || fill >= 0.45);
+
+    compClass[id] = looksLikeCrop ? 1 : 2;
+  }
+
+  // ---------- Step 6: per-pixel classification ----------
+  // Inside a crop component, pixels that fall in non-row columns are
+  // treated as interrow weeds. Inside a weed component, every pixel is weed.
+  const classMask = new Uint8Array(N); // 0 soil, 1 crop, 2 weed
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const p = y * w + x;
-      if (!cleaned[p]) continue;
-      const i = p * 4;
-      const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
-      const rn = r / 255, gn = g / 255, bn = b / 255;
-      const mx = Math.max(rn, gn, bn), mn = Math.min(rn, gn, bn);
-      const d = mx - mn;
-      let hue = 0;
-      if (d !== 0) {
-        if (mx === rn) hue = 60 * (((gn - bn) / d) % 6);
-        else if (mx === gn) hue = 60 * ((bn - rn) / d + 2);
-        else hue = 60 * ((rn - gn) / d + 4);
-        if (hue < 0) hue += 360;
+      if (!cleaned[p]) { classMask[p] = 0; continue; }
+      const id = labels[p];
+      const cc = compClass[id];
+      if (cc === 1) {
+        const inside = useCols ? inRow[x] : inRow[y];
+        classMask[p] = inside ? 1 : 2;
+      } else {
+        classMask[p] = 2;
       }
-      const sat = mx === 0 ? 0 : d / mx;
-      const val = mx;
-
-      let sum = 0, sum2 = 0, cnt = 0;
-      const x0 = Math.max(0, x - R), x1 = Math.min(w - 1, x + R);
-      const y0 = Math.max(0, y - R), y1 = Math.min(h - 1, y + R);
-      for (let yy = y0; yy <= y1; yy++) {
-        for (let xx = x0; xx <= x1; xx++) {
-          const e = exg[yy * w + xx];
-          sum += e; sum2 += e * e; cnt++;
-        }
-      }
-      const mean = sum / cnt;
-      const variance = sum2 / cnt - mean * mean;
-
-      let score = 0;
-      if (hue < hueCut) score++;
-      if (val > valCut) score++;
-      if (sat < satCut) score++;
-      if (variance > varCut) score++;
-      if (score >= scoreNeeded) weedPixel[p] = 1;
     }
   }
 
-  // Step 3b: clean weed mask.
-  let weedMask = morph(weedPixel, w, h, "erode", 1);
-  weedMask = morph(weedMask, w, h, "dilate", strength > 0.66 ? 3 : 2);
-  for (let p = 0; p < N; p++) if (!cleaned[p]) weedMask[p] = 0;
+  const countClasses = () => {
+    let c = 0, wd = 0, sl = 0;
+    for (let p = 0; p < N; p++) {
+      const v = classMask[p];
+      if (v === 1) c++; else if (v === 2) wd++; else sl++;
+    }
+    return { c, wd, sl };
+  };
+  let cnt = countClasses();
 
-  // Step 3c: connected-component / area filtering on weed mask.
-  const weedCC = connectedComponents(weedMask, w, h);
-  const weedMinCluster = Math.max(settings.minPatch, Math.floor(N * 0.0004));
-  for (let p = 0; p < N; p++) {
-    if (weedMask[p] && weedCC.sizes[weedCC.labels[p]] < weedMinCluster) weedMask[p] = 0;
-  }
-
-  // Step 3d: integrate previous "isolated small blob = weed" rule, but gated
-  // by HSV evidence so it doesn't fire on clean crop / no-weed images.
-  // For each vegetation component, count how many of its pixels look weed-like.
-  const compWeedCount = new Int32Array(sizes.length);
-  for (let p = 0; p < N; p++) {
-    if (cleaned[p] && weedPixel[p]) compWeedCount[labels[p]]++;
-  }
-  // A small isolated blob is only a weed if at least ~20% of its pixels
-  // carry HSV weed signal. Stops random crop speckles from going red.
-  const smallBlobWeedRatio = 0.20 - sens * 0.10; // 0.20 at low sens, 0.10 at high
-  const smallBlobIsWeed = new Uint8Array(sizes.length);
-  for (let id = 1; id < sizes.length; id++) {
-    if (sizes[id] > 0 && sizes[id] <= weedMaxSize) {
-      const ratio = compWeedCount[id] / sizes[id];
-      if (ratio >= smallBlobWeedRatio) smallBlobIsWeed[id] = 1;
+  // ---------- Step 7: safety rails so output never collapses to one color ----------
+  // 7a) Too much weed relative to vegetation → promote biggest weed components to crop.
+  if (vegTotal > 0 && cnt.wd / vegTotal > 0.6) {
+    const weedIds: number[] = [];
+    for (let id = 1; id < NC; id++) if (compClass[id] === 2) weedIds.push(id);
+    weedIds.sort((a, b) => sizes[b] - sizes[a]);
+    for (const id of weedIds) {
+      if (sizes[id] < cropMinSize / 2) break;
+      compClass[id] = 1;
+      for (let p = 0; p < N; p++) if (labels[p] === id) classMask[p] = 1;
+      cnt = countClasses();
+      if (cnt.wd / vegTotal <= 0.35) break;
     }
   }
 
-  // Step 4: render classes onto semi-transparent overlay.
+  // 7b) Almost no weed detected but plenty of small isolated components exist →
+  //     reclassify the smallest crop components (below row band) as weed.
+  if (vegTotal > 0 && cnt.wd / vegTotal < 0.02) {
+    const cropIds: number[] = [];
+    for (let id = 1; id < NC; id++) if (compClass[id] === 1 && sizes[id] < cropMinSize) cropIds.push(id);
+    cropIds.sort((a, b) => sizes[a] - sizes[b]);
+    for (const id of cropIds) {
+      compClass[id] = 2;
+      for (let p = 0; p < N; p++) if (labels[p] === id) classMask[p] = 2;
+      cnt = countClasses();
+      if (cnt.wd / vegTotal >= 0.05) break;
+    }
+  }
+
+  // 7c) Hard cap: if vegetation covers >95% of the image, restore the weakest
+  //     vegetation pixels to soil so brown is always visible somewhere.
+  if (vegTotal / N > 0.95) {
+    const target = Math.floor(N * 0.9);
+    const sorted = Array.from(exg).map((v, i) => [v, i] as [number, number]);
+    sorted.sort((a, b) => a[0] - b[0]);
+    let removed = 0;
+    for (const [, idx] of sorted) {
+      if (classMask[idx] === 0) continue;
+      classMask[idx] = 0;
+      removed++;
+      if (vegTotal - removed <= target) break;
+    }
+    cnt = countClasses();
+  }
+
+  // ---------- Step 8: render overlay ----------
   const out = ctx.createImageData(w, h);
   const cells = Array.from({ length: 64 }, () => ({ weed: 0, total: 0 }));
   const cw = w / 8, ch = h / 8;
   let crop = 0, weed = 0, soil = 0;
-  const ALPHA = 0.25 + strength * 0.5;            // 0.25..0.75
+  const ALPHA = 0.25 + strength * 0.5;
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const p = y * w + x;
       const i = p * 4;
       const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
-
-      let cls: "crop" | "weed" | "soil";
-      if (cleaned[p]) {
-        if (weedMask[p]) cls = "weed";
-        else if (smallBlobIsWeed[labels[p]]) cls = "weed";
-        else cls = "crop";
-      } else {
-        cls = "soil";
-      }
-
+      const v = classMask[p];
       let cr = 0, cg = 0, cb = 0;
-      if (cls === "crop") { cr = 34; cg = 197; cb = 94; crop++; }
-      else if (cls === "weed") { cr = 239; cg = 68; cb = 68; weed++; }
-      else { cr = 120; cg = 72; cb = 40; soil++; }
+      let cls: "crop" | "weed" | "soil";
+      if (v === 1) { cr = 34; cg = 197; cb = 94; crop++; cls = "crop"; }
+      else if (v === 2) { cr = 239; cg = 68; cb = 68; weed++; cls = "weed"; }
+      else { cr = 120; cg = 72; cb = 40; soil++; cls = "soil"; }
 
       out.data[i]     = Math.round(r * (1 - ALPHA) + cr * ALPHA);
       out.data[i + 1] = Math.round(g * (1 - ALPHA) + cg * ALPHA);
@@ -290,7 +372,8 @@ async function processImage(file: File, settings: Settings): Promise<Result> {
   const cropPct = (crop / total) * 100;
   const weedPct = (weed / total) * 100;
   const soilPct = (soil / total) * 100;
-  const density = vegTotal > 0 ? (weed / vegTotal) * 100 : 0;
+  const vegPixels = crop + weed;
+  const density = vegPixels > 0 ? (weed / vegPixels) * 100 : 0;
   const dose = +(BASE_DOSE * (density / 100)).toFixed(2);
   const saved = +(BASE_DOSE - dose).toFixed(2);
 
