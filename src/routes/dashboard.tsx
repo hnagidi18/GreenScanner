@@ -375,16 +375,15 @@ function DashboardPage() {
   const [result, setResult] = useState<Result | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [settings, setSettings] = useState<Settings>(RECOMMENDED);
   const inputRef = useRef<HTMLInputElement>(null);
   const runIdRef = useRef(0);
 
-  const runProcess = useCallback(async (f: File, s: Settings) => {
+  const runProcess = useCallback(async (f: File) => {
     const id = ++runIdRef.current;
     setLoading(true);
     setError(null);
     try {
-      const r = await processImage(f, s);
+      const r = await processImage(f);
       if (id === runIdRef.current) setResult(r);
     } catch (e: any) {
       if (id === runIdRef.current) setError(e?.message ?? "Failed to process image.");
@@ -402,16 +401,8 @@ function DashboardPage() {
     setFile(f);
     setOriginalUrl(URL.createObjectURL(f));
     setResult(null);
-    runProcess(f, settings);
-  }, [runProcess, settings]);
-
-  // Re-run when settings change (debounced) and a file is loaded.
-  useEffect(() => {
-    if (!file) return;
-    const t = setTimeout(() => runProcess(file, settings), 180);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings, file]);
+    runProcess(f);
+  }, [runProcess]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -476,47 +467,6 @@ function DashboardPage() {
           {file && <p className="mt-3 text-xs text-muted-foreground">Selected: {file.name}</p>}
           {error && <p className="mt-3 text-sm text-[var(--weed)] font-semibold">{error}</p>}
         </div>
-
-        {/* Tuning controls */}
-        {file && (
-          <div className="rounded-3xl bg-card border border-border p-6 shadow-card">
-            <div className="flex items-center justify-between mb-5 gap-3 flex-wrap">
-              <div className="flex items-center gap-2">
-                <Sliders className="h-5 w-5 text-primary" />
-                <h3 className="font-display font-bold text-lg">Segmentation controls</h3>
-              </div>
-              <button
-                onClick={() => setSettings(RECOMMENDED)}
-                className="inline-flex items-center gap-2 rounded-full bg-secondary hover:bg-secondary/80 px-4 py-2 text-sm font-semibold transition"
-              >
-                <RotateCcw className="h-4 w-4" /> Use Recommended Settings
-              </button>
-            </div>
-            <div className="grid md:grid-cols-3 gap-6">
-              <SliderRow
-                label="Weed Sensitivity"
-                value={settings.sensitivity}
-                min={0} max={100} step={1}
-                onChange={(v) => setSettings((s) => ({ ...s, sensitivity: v }))}
-                hint="Higher = detects more weed pixels"
-              />
-              <SliderRow
-                label="Min Weed Patch Size"
-                value={settings.minPatch}
-                min={5} max={300} step={5}
-                onChange={(v) => setSettings((s) => ({ ...s, minPatch: v }))}
-                hint="Drops tiny red speckles"
-              />
-              <SliderRow
-                label="Segmentation Strength"
-                value={settings.strength}
-                min={0} max={100} step={1}
-                onChange={(v) => setSettings((s) => ({ ...s, strength: v }))}
-                hint="Overlay opacity & cleanup"
-              />
-            </div>
-          </div>
-        )}
 
         {loading && (
           <div className="rounded-2xl bg-card border border-border p-8 flex items-center gap-3 justify-center shadow-card">
