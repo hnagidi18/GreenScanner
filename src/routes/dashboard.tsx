@@ -1,0 +1,572 @@
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Leaf, Upload, Image as ImageIcon, Droplets, Sprout, BarChart3,
+  TrendingDown, Grid3x3, ArrowLeft, Loader2, Sparkles, RotateCcw, Sliders,
+} from "lucide-react";
+import { Slider } from "@/components/ui/slider";
+
+export const Route = createFileRoute("/dashboard")({
+  head: () => ({
+    meta: [
+      { title: "Green-Scanner Dashboard — Analyze Aerial Image" },
+      { name: "description", content: "Upload an aerial JPG of your field to detect crop, weed, and soil and get a precision spraying plan." },
+    ],
+  }),
+  component: DashboardPage,
+});
+
+type Result = {
+  cropPct: number;
+  weedPct: number;
+  soilPct: number;
+  density: number;
+  dose: number;
+  saved: number;
+  grid: boolean[];
+  onCount: number;
+  segmentedUrl: string;
+};
+
+type Settings = {
+  sensitivity: number;   // 0-100, weed detection aggressiveness
+  minPatch: number;      // 5-300 px, min connected weed cluster size
+  strength: number;      // 0-100, overlay opacity / segmentation crispness
+};
+
+const RECOMMENDED: Settings = { sensitivity: 50, minPatch: 30, strength: 55 };
+const BASE_DOSE = 10;
+
+function morph(mask: Uint8Array, w: number, h: number, op: "erode" | "dilate", iters = 1) {
+  let src = mask;
+  for (let k = 0; k < iters; k++) {
+    const dst = new Uint8Array(src.length);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (op === "erode") {
+          let v = 1;
+          for (let dy = -1; dy <= 1 && v; dy++) {
+            for (let dx = -1; dx <= 1 && v; dx++) {
+              const nx = x + dx, ny = y + dy;
+              if (nx < 0 || ny < 0 || nx >= w || ny >= h) { v = 0; break; }
+              if (!src[ny * w + nx]) v = 0;
+            }
+          }
+          dst[i] = v;
+        } else {
+          let v = 0;
+          for (let dy = -1; dy <= 1 && !v; dy++) {
+            for (let dx = -1; dx <= 1 && !v; dx++) {
+              const nx = x + dx, ny = y + dy;
+              if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+              if (src[ny * w + nx]) { v = 1; break; }
+            }
+          }
+          dst[i] = v;
+        }
+      }
+    }
+    src = dst;
+  }
+  return src;
+}
+
+function connectedComponents(mask: Uint8Array, w: number, h: number) {
+  const labels = new Int32Array(mask.length);
+  const sizes: number[] = [0];
+  let next = 1;
+  const stack: number[] = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (!mask[i] || labels[i]) continue;
+      const id = next++;
+      let size = 0;
+      stack.push(i);
+      labels[i] = id;
+      while (stack.length) {
+        const p = stack.pop()!;
+        size++;
+        const px = p % w, py = (p - px) / w;
+        const ns = [
+          py > 0 ? p - w : -1,
+          py < h - 1 ? p + w : -1,
+          px > 0 ? p - 1 : -1,
+          px < w - 1 ? p + 1 : -1,
+        ];
+        for (const n of ns) {
+          if (n >= 0 && mask[n] && !labels[n]) {
+            labels[n] = id;
+            stack.push(n);
+          }
+        }
+      }
+      sizes.push(size);
+    }
+  }
+  return { labels, sizes };
+}
+
+async function processImage(file: File, settings: Settings): Promise<Result> {
+  const url = URL.createObjectURL(file);
+  const img = await new Promise<HTMLImageElement>((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = rej;
+    i.src = url;
+  });
+
+  const MAX = 640;
+  const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+  const w = Math.round(img.width * scale);
+  const h = Math.round(img.height * scale);
+
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(img, 0, 0, w, h);
+  const src = ctx.getImageData(0, 0, w, h);
+  const N = w * h;
+
+  // Map settings (0-100) to physical thresholds.
+  const sens = settings.sensitivity / 100;        // 0..1
+  const strength = settings.strength / 100;       // 0..1
+  // Score threshold: higher sensitivity → fewer cues required.
+  // sens 0   -> 4 cues, sens 0.5 -> 2 cues, sens 1 -> 1 cue
+  const scoreNeeded = sens > 0.8 ? 1 : sens > 0.4 ? 2 : sens > 0.15 ? 3 : 4;
+  // Cue thresholds also widen with sensitivity slightly.
+  const hueCut = 65 + sens * 15;                  // 65..80
+  const satCut = 0.40 + sens * 0.15;              // 0.40..0.55
+  const valCut = 0.60 - sens * 0.10;              // 0.60..0.50
+  const varCut = 450 - sens * 200;                // 450..250
+
+  // Step 1: Excess-Green vegetation mask with adaptive threshold.
+  const exg = new Int16Array(N);
+  let exgMin = 1e9, exgMax = -1e9;
+  for (let p = 0; p < N; p++) {
+    const i = p * 4;
+    const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
+    const v = 2 * g - r - b;
+    exg[p] = v;
+    if (v < exgMin) exgMin = v;
+    if (v > exgMax) exgMax = v;
+  }
+  // Strength tightens vegetation threshold (cleaner soil separation).
+  const exgFloor = 12 + strength * 12;            // 12..24
+  const exgThresh = Math.max(exgFloor, Math.round((exgMax - exgMin) * 0.18) + Math.min(0, exgMin));
+  const veg = new Uint8Array(N);
+  for (let p = 0; p < N; p++) veg[p] = exg[p] > exgThresh ? 1 : 0;
+
+  // Step 2: Noise removal — open. Stronger setting = stronger cleanup.
+  const openIters = strength > 0.66 ? 2 : 1;
+  let cleaned = morph(veg, w, h, "erode", openIters);
+  cleaned = morph(cleaned, w, h, "dilate", openIters);
+
+  const { labels, sizes } = connectedComponents(cleaned, w, h);
+  // Tiny isolated vegetation blobs are almost always weeds.
+  const weedMaxSize = Math.max(40, Math.floor(N * (0.002 + sens * 0.004)));
+  let vegTotal = 0;
+  for (let p = 0; p < N; p++) if (cleaned[p]) vegTotal++;
+
+  // Step 3: per-pixel weed score on vegetation (HSV + local ExG texture).
+  const weedPixel = new Uint8Array(N);
+  const R = 2;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = y * w + x;
+      if (!cleaned[p]) continue;
+      const i = p * 4;
+      const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
+      const rn = r / 255, gn = g / 255, bn = b / 255;
+      const mx = Math.max(rn, gn, bn), mn = Math.min(rn, gn, bn);
+      const d = mx - mn;
+      let hue = 0;
+      if (d !== 0) {
+        if (mx === rn) hue = 60 * (((gn - bn) / d) % 6);
+        else if (mx === gn) hue = 60 * ((bn - rn) / d + 2);
+        else hue = 60 * ((rn - gn) / d + 4);
+        if (hue < 0) hue += 360;
+      }
+      const sat = mx === 0 ? 0 : d / mx;
+      const val = mx;
+
+      let sum = 0, sum2 = 0, cnt = 0;
+      const x0 = Math.max(0, x - R), x1 = Math.min(w - 1, x + R);
+      const y0 = Math.max(0, y - R), y1 = Math.min(h - 1, y + R);
+      for (let yy = y0; yy <= y1; yy++) {
+        for (let xx = x0; xx <= x1; xx++) {
+          const e = exg[yy * w + xx];
+          sum += e; sum2 += e * e; cnt++;
+        }
+      }
+      const mean = sum / cnt;
+      const variance = sum2 / cnt - mean * mean;
+
+      let score = 0;
+      if (hue < hueCut) score++;
+      if (val > valCut) score++;
+      if (sat < satCut) score++;
+      if (variance > varCut) score++;
+      if (score >= scoreNeeded) weedPixel[p] = 1;
+    }
+  }
+
+  // Step 3b: clean weed mask.
+  let weedMask = morph(weedPixel, w, h, "erode", 1);
+  weedMask = morph(weedMask, w, h, "dilate", strength > 0.66 ? 3 : 2);
+  for (let p = 0; p < N; p++) if (!cleaned[p]) weedMask[p] = 0;
+
+  // Step 3c: connected-component / area filtering on weed mask.
+  const weedCC = connectedComponents(weedMask, w, h);
+  const weedMinCluster = Math.max(settings.minPatch, Math.floor(N * 0.0004));
+  for (let p = 0; p < N; p++) {
+    if (weedMask[p] && weedCC.sizes[weedCC.labels[p]] < weedMinCluster) weedMask[p] = 0;
+  }
+
+  // Step 3d: integrate previous "isolated small blob = weed" rule, but gated
+  // by HSV evidence so it doesn't fire on clean crop / no-weed images.
+  // For each vegetation component, count how many of its pixels look weed-like.
+  const compWeedCount = new Int32Array(sizes.length);
+  for (let p = 0; p < N; p++) {
+    if (cleaned[p] && weedPixel[p]) compWeedCount[labels[p]]++;
+  }
+  // A small isolated blob is only a weed if at least ~20% of its pixels
+  // carry HSV weed signal. Stops random crop speckles from going red.
+  const smallBlobWeedRatio = 0.20 - sens * 0.10; // 0.20 at low sens, 0.10 at high
+  const smallBlobIsWeed = new Uint8Array(sizes.length);
+  for (let id = 1; id < sizes.length; id++) {
+    if (sizes[id] > 0 && sizes[id] <= weedMaxSize) {
+      const ratio = compWeedCount[id] / sizes[id];
+      if (ratio >= smallBlobWeedRatio) smallBlobIsWeed[id] = 1;
+    }
+  }
+
+  // Step 4: render classes onto semi-transparent overlay.
+  const out = ctx.createImageData(w, h);
+  const cells = Array.from({ length: 64 }, () => ({ weed: 0, total: 0 }));
+  const cw = w / 8, ch = h / 8;
+  let crop = 0, weed = 0, soil = 0;
+  const ALPHA = 0.25 + strength * 0.5;            // 0.25..0.75
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = y * w + x;
+      const i = p * 4;
+      const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
+
+      let cls: "crop" | "weed" | "soil";
+      if (cleaned[p]) {
+        if (weedMask[p]) cls = "weed";
+        else if (smallBlobIsWeed[labels[p]]) cls = "weed";
+        else cls = "crop";
+      } else {
+        cls = "soil";
+      }
+
+      let cr = 0, cg = 0, cb = 0;
+      if (cls === "crop") { cr = 34; cg = 197; cb = 94; crop++; }
+      else if (cls === "weed") { cr = 239; cg = 68; cb = 68; weed++; }
+      else { cr = 120; cg = 72; cb = 40; soil++; }
+
+      out.data[i]     = Math.round(r * (1 - ALPHA) + cr * ALPHA);
+      out.data[i + 1] = Math.round(g * (1 - ALPHA) + cg * ALPHA);
+      out.data[i + 2] = Math.round(b * (1 - ALPHA) + cb * ALPHA);
+      out.data[i + 3] = 255;
+
+      const cx = Math.min(7, Math.floor(x / cw));
+      const cy = Math.min(7, Math.floor(y / ch));
+      const idx = cy * 8 + cx;
+      cells[idx].total++;
+      if (cls === "weed") cells[idx].weed++;
+    }
+  }
+
+  ctx.putImageData(out, 0, 0);
+  const segmentedUrl = c.toDataURL("image/jpeg", 0.9);
+  URL.revokeObjectURL(url);
+
+  const total = crop + weed + soil;
+  const cropPct = (crop / total) * 100;
+  const weedPct = (weed / total) * 100;
+  const soilPct = (soil / total) * 100;
+  const density = vegTotal > 0 ? (weed / vegTotal) * 100 : 0;
+  const dose = +(BASE_DOSE * (density / 100)).toFixed(2);
+  const saved = +(BASE_DOSE - dose).toFixed(2);
+
+  const grid = cells.map((cc) => cc.total > 0 && (cc.weed / cc.total) > 0.012);
+  const onCount = grid.filter(Boolean).length;
+
+  return { cropPct, weedPct, soilPct, density, dose, saved, grid, onCount, segmentedUrl };
+}
+
+function DashboardPage() {
+  const [file, setFile] = useState<File | null>(null);
+  const [originalUrl, setOriginalUrl] = useState<string | null>(null);
+  const [result, setResult] = useState<Result | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [settings, setSettings] = useState<Settings>(RECOMMENDED);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const runIdRef = useRef(0);
+
+  const runProcess = useCallback(async (f: File, s: Settings) => {
+    const id = ++runIdRef.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await processImage(f, s);
+      if (id === runIdRef.current) setResult(r);
+    } catch (e: any) {
+      if (id === runIdRef.current) setError(e?.message ?? "Failed to process image.");
+    } finally {
+      if (id === runIdRef.current) setLoading(false);
+    }
+  }, []);
+
+  const onFile = useCallback((f: File) => {
+    setError(null);
+    if (!/\.(jpe?g)$/i.test(f.name) && f.type !== "image/jpeg") {
+      setError("Please upload a JPG/JPEG image.");
+      return;
+    }
+    setFile(f);
+    setOriginalUrl(URL.createObjectURL(f));
+    setResult(null);
+    runProcess(f, settings);
+  }, [runProcess, settings]);
+
+  // Re-run when settings change (debounced) and a file is loaded.
+  useEffect(() => {
+    if (!file) return;
+    const t = setTimeout(() => runProcess(file, settings), 180);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings, file]);
+
+  return (
+    <div className="min-h-screen bg-background">
+      <header className="sticky top-0 z-50 backdrop-blur-md bg-background/80 border-b border-border/60">
+        <div className="container-page flex items-center justify-between h-16">
+          <Link to="/" className="flex items-center gap-2 font-display font-bold text-lg">
+            <span className="grid place-items-center h-9 w-9 rounded-xl gradient-primary text-primary-foreground shadow-soft">
+              <Leaf className="h-5 w-5" />
+            </span>
+            Green-Scanner
+          </Link>
+          <Link to="/" className="inline-flex items-center gap-2 rounded-full bg-card border border-border px-4 py-2 text-sm font-semibold hover:bg-secondary transition">
+            <ArrowLeft className="h-4 w-4" /> Back to site
+          </Link>
+        </div>
+      </header>
+
+      <section className="gradient-hero">
+        <div className="container-page py-12 md:py-16">
+          <div className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1 text-xs font-semibold text-primary mb-4 shadow-soft">
+            <Sparkles className="h-3.5 w-3.5" /> Live Analysis
+          </div>
+          <h1 className="font-display text-3xl md:text-5xl font-extrabold">Analyze your aerial field image</h1>
+          <p className="mt-3 text-muted-foreground max-w-2xl">
+            Upload a JPG taken from a drone or aerial camera. Green-Scanner segments crop, weed and soil, then computes weed density,
+            herbicide dose and a precision 8×8 spray plan.
+          </p>
+        </div>
+      </section>
+
+      <main className="container-page py-10 space-y-8">
+        <div
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            const f = e.dataTransfer.files?.[0];
+            if (f) onFile(f);
+          }}
+          className="rounded-3xl border-2 border-dashed border-border bg-card p-8 md:p-12 text-center shadow-card"
+        >
+          <div className="mx-auto h-14 w-14 rounded-2xl gradient-primary text-primary-foreground grid place-items-center mb-4 shadow-soft">
+            <Upload className="h-6 w-6" />
+          </div>
+          <h2 className="font-display text-xl font-bold">Upload aerial field image (JPG)</h2>
+          <p className="text-sm text-muted-foreground mt-1">Drag & drop a .jpg file here or click below to choose.</p>
+          <input
+            ref={inputRef}
+            type="file"
+            accept="image/jpeg,.jpg,.jpeg"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onFile(f);
+            }}
+          />
+          <button
+            onClick={() => inputRef.current?.click()}
+            className="mt-5 inline-flex items-center gap-2 rounded-full gradient-primary text-primary-foreground px-6 py-3 font-semibold shadow-soft hover:opacity-95 transition"
+          >
+            <ImageIcon className="h-4 w-4" /> Choose JPG file
+          </button>
+          {file && <p className="mt-3 text-xs text-muted-foreground">Selected: {file.name}</p>}
+          {error && <p className="mt-3 text-sm text-[var(--weed)] font-semibold">{error}</p>}
+        </div>
+
+        {/* Tuning controls */}
+        {file && (
+          <div className="rounded-3xl bg-card border border-border p-6 shadow-card">
+            <div className="flex items-center justify-between mb-5 gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <Sliders className="h-5 w-5 text-primary" />
+                <h3 className="font-display font-bold text-lg">Segmentation controls</h3>
+              </div>
+              <button
+                onClick={() => setSettings(RECOMMENDED)}
+                className="inline-flex items-center gap-2 rounded-full bg-secondary hover:bg-secondary/80 px-4 py-2 text-sm font-semibold transition"
+              >
+                <RotateCcw className="h-4 w-4" /> Use Recommended Settings
+              </button>
+            </div>
+            <div className="grid md:grid-cols-3 gap-6">
+              <SliderRow
+                label="Weed Sensitivity"
+                value={settings.sensitivity}
+                min={0} max={100} step={1}
+                onChange={(v) => setSettings((s) => ({ ...s, sensitivity: v }))}
+                hint="Higher = detects more weed pixels"
+              />
+              <SliderRow
+                label="Min Weed Patch Size"
+                value={settings.minPatch}
+                min={5} max={300} step={5}
+                onChange={(v) => setSettings((s) => ({ ...s, minPatch: v }))}
+                hint="Drops tiny red speckles"
+              />
+              <SliderRow
+                label="Segmentation Strength"
+                value={settings.strength}
+                min={0} max={100} step={1}
+                onChange={(v) => setSettings((s) => ({ ...s, strength: v }))}
+                hint="Overlay opacity & cleanup"
+              />
+            </div>
+          </div>
+        )}
+
+        {loading && (
+          <div className="rounded-2xl bg-card border border-border p-8 flex items-center gap-3 justify-center shadow-card">
+            <Loader2 className="h-5 w-5 animate-spin text-primary" />
+            <span className="font-medium">Segmenting image and computing spray plan…</span>
+          </div>
+        )}
+
+        {result && originalUrl && (
+          <>
+            <div className="grid md:grid-cols-2 gap-6">
+              <Panel label="Original image">
+                <img src={originalUrl} alt="Original aerial" className="w-full h-full object-cover" />
+              </Panel>
+              <Panel label="Segmented output (Green=Crop · Red=Weed · Brown=Soil)">
+                <img src={result.segmentedUrl} alt="Segmented" className="w-full h-full object-cover" />
+              </Panel>
+            </div>
+
+            <div className="grid sm:grid-cols-2 lg:grid-cols-5 gap-4">
+              <MetricCard label="Crop Coverage" value={`${result.cropPct.toFixed(2)}%`} color="var(--leaf)" Icon={Sprout} />
+              <MetricCard label="Weed Density" value={`${result.weedPct.toFixed(2)}%`} color="var(--weed)" Icon={Leaf} />
+              <MetricCard label="Soil Coverage" value={`${result.soilPct.toFixed(2)}%`} color="var(--soil)" Icon={BarChart3} />
+              <MetricCard label="Required Herbicide" value={`${result.dose} L/ac`} color="var(--info)" Icon={Droplets} />
+              <MetricCard label="Chemical Saved" value={`${result.saved} L/ac`} color="var(--warn)" Icon={TrendingDown} />
+            </div>
+
+            <div className="grid lg:grid-cols-2 gap-6">
+              <div className="rounded-3xl bg-card border border-border p-6 shadow-card">
+                <div className="flex items-center gap-2 mb-4">
+                  <Grid3x3 className="h-5 w-5 text-primary" />
+                  <h3 className="font-display font-bold text-lg">Precision spray grid (8×8)</h3>
+                </div>
+                <div className="grid grid-cols-8 gap-2">
+                  {result.grid.map((on, i) => (
+                    <div
+                      key={i}
+                      className={`aspect-square rounded-lg grid place-items-center text-[10px] font-bold ${on ? "bg-[var(--weed)] text-white" : "bg-secondary text-muted-foreground"}`}
+                    >
+                      {on ? "ON" : "OFF"}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="rounded-3xl gradient-primary text-primary-foreground p-6 md:p-8 shadow-card">
+                <h3 className="font-display font-bold text-xl">Spray decision summary</h3>
+                <p className="opacity-90 mt-2 text-sm">
+                  Based on a measured weed density of {result.density.toFixed(2)}% within vegetation,
+                  Green-Scanner recommends targeted spraying on {result.onCount} of 64 grid cells.
+                </p>
+                <div className="mt-6 grid grid-cols-2 gap-3">
+                  <Stat label="ON cells" value={`${result.onCount} / 64`} />
+                  <Stat label="Coverage saved" value={`${Math.round(((64 - result.onCount) / 64) * 100)}%`} />
+                  <Stat label="Dose / acre" value={`${result.dose} L`} />
+                  <Stat label="Saved / acre" value={`${result.saved} L`} />
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </main>
+
+      <footer className="border-t border-border py-8 mt-10">
+        <div className="container-page text-center text-sm text-muted-foreground">
+          Green-Scanner | AI for Precision Agriculture
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+function SliderRow({
+  label, value, min, max, step, onChange, hint,
+}: {
+  label: string; value: number; min: number; max: number; step: number;
+  onChange: (v: number) => void; hint?: string;
+}) {
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-2">
+        <span className="text-sm font-semibold">{label}</span>
+        <span className="text-xs font-mono text-muted-foreground">{value}</span>
+      </div>
+      <Slider
+        value={[value]}
+        min={min} max={max} step={step}
+        onValueChange={(v) => onChange(v[0])}
+      />
+      {hint && <p className="text-xs text-muted-foreground mt-2">{hint}</p>}
+    </div>
+  );
+}
+
+function Panel({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-3xl bg-card border border-border shadow-card overflow-hidden">
+      <div className="aspect-[4/3] bg-secondary">{children}</div>
+      <div className="p-4 text-sm font-semibold text-center text-muted-foreground">{label}</div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value, color, Icon }: { label: string; value: string; color: string; Icon: any }) {
+  return (
+    <div className="rounded-2xl bg-card border border-border p-5 shadow-card">
+      <span className="h-9 w-9 rounded-lg grid place-items-center" style={{ background: `${color}22`, color }}>
+        <Icon className="h-4 w-4" />
+      </span>
+      <div className="text-xs text-muted-foreground mt-4">{label}</div>
+      <div className="text-2xl font-display font-bold mt-1">{value}</div>
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl bg-white/15 backdrop-blur p-3">
+      <div className="text-xs opacity-80">{label}</div>
+      <div className="font-display font-bold text-lg">{value}</div>
+    </div>
+  );
+}
