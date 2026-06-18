@@ -1,10 +1,9 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   Leaf, Upload, Image as ImageIcon, Droplets, Sprout, BarChart3,
-  TrendingDown, Grid3x3, ArrowLeft, Loader2, Sparkles, RotateCcw, Sliders,
+  TrendingDown, Grid3x3, ArrowLeft, Loader2, Sparkles,
 } from "lucide-react";
-import { Slider } from "@/components/ui/slider";
 
 export const Route = createFileRoute("/dashboard")({
   head: () => ({
@@ -28,13 +27,6 @@ type Result = {
   segmentedUrl: string;
 };
 
-type Settings = {
-  sensitivity: number;   // 0-100, weed detection aggressiveness
-  minPatch: number;      // 5-300 px, min connected weed cluster size
-  strength: number;      // 0-100, overlay opacity / segmentation crispness
-};
-
-const RECOMMENDED: Settings = { sensitivity: 50, minPatch: 30, strength: 55 };
 const BASE_DOSE = 10;
 
 function morph(mask: Uint8Array, w: number, h: number, op: "erode" | "dilate", iters = 1) {
@@ -108,7 +100,35 @@ function connectedComponents(mask: Uint8Array, w: number, h: number) {
   return { labels, sizes };
 }
 
-async function processImage(file: File, settings: Settings): Promise<Result> {
+function otsuThreshold(values: Float32Array | number[], indices: Int32Array | null, lo: number, hi: number): number {
+  const BINS = 64;
+  const hist = new Int32Array(BINS);
+  const step = (hi - lo) / BINS || 1;
+  const len = indices ? indices.length : (values as Float32Array).length;
+  for (let k = 0; k < len; k++) {
+    const v = indices ? (values as Float32Array)[indices[k]] : (values as Float32Array)[k];
+    let b = Math.floor((v - lo) / step);
+    if (b < 0) b = 0; else if (b >= BINS) b = BINS - 1;
+    hist[b]++;
+  }
+  let sumAll = 0;
+  for (let i = 0; i < BINS; i++) sumAll += i * hist[i];
+  let wB = 0, sumB = 0, maxVar = -1, bestT = 0;
+  for (let t = 0; t < BINS; t++) {
+    wB += hist[t];
+    if (wB === 0) continue;
+    const wF = len - wB;
+    if (wF === 0) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (sumAll - sumB) / wF;
+    const between = wB * wF * (mB - mF) * (mB - mF);
+    if (between > maxVar) { maxVar = between; bestT = t; }
+  }
+  return lo + (bestT + 0.5) * step;
+}
+
+async function processImage(file: File): Promise<Result> {
   const url = URL.createObjectURL(file);
   const img = await new Promise<HTMLImageElement>((res, rej) => {
     const i = new Image();
@@ -129,195 +149,161 @@ async function processImage(file: File, settings: Settings): Promise<Result> {
   const src = ctx.getImageData(0, 0, w, h);
   const N = w * h;
 
-  const sens = settings.sensitivity / 100;        // 0..1
-  const strength = settings.strength / 100;       // 0..1
-
-  // ---------- Step 1: Excess-Green per pixel ----------
+  // ---------- Step 1: Excess-Green index per pixel ----------
+  // ExG = 2G - R - B is a standard vegetation index that emphasises
+  // chlorophyll-rich pixels and suppresses brown soil.
   const exg = new Float32Array(N);
-  let exgSum = 0;
+  let exgMin = Infinity, exgMax = -Infinity;
   for (let p = 0; p < N; p++) {
     const i = p * 4;
     const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
     const v = 2 * g - r - b;
     exg[p] = v;
-    exgSum += v;
+    if (v < exgMin) exgMin = v;
+    if (v > exgMax) exgMax = v;
   }
-  const exgMean = exgSum / N;
-  let varAcc = 0;
-  for (let p = 0; p < N; p++) { const d = exg[p] - exgMean; varAcc += d * d; }
-  const exgStd = Math.sqrt(varAcc / N) || 1;
 
-  // ---------- Step 2: adaptive vegetation threshold ----------
-  // Higher sensitivity → slightly lower threshold (more vegetation).
-  const baseThr = Math.max(10, exgMean + (0.25 - sens * 0.15) * exgStd);
-  const fracAt = (t: number) => { let c = 0; for (let p = 0; p < N; p++) if (exg[p] > t) c++; return c / N; };
-  let thr = baseThr;
-  let frac = fracAt(thr);
-  // Keep vegetation between 3% and 88% so output is never one solid color.
-  let guard = 0;
-  while (frac > 0.88 && guard++ < 40) { thr += Math.max(2, exgStd * 0.1); frac = fracAt(thr); }
-  guard = 0;
-  while (frac < 0.03 && guard++ < 40) { thr -= Math.max(2, exgStd * 0.1); frac = fracAt(thr); }
+  // ---------- Step 2: soil / vegetation split via Otsu ----------
+  // Otsu finds the threshold that best separates the two natural classes
+  // (soil vs. vegetation) in the ExG histogram — no manual tuning needed.
+  let vegThr = otsuThreshold(exg, null, exgMin, exgMax);
+  // Make sure ExG must actually be positive-ish to count as vegetation
+  // (prevents grey/brown speckles from being labelled vegetation).
+  vegThr = Math.max(vegThr, 8);
 
-  const veg = new Uint8Array(N);
-  for (let p = 0; p < N; p++) veg[p] = exg[p] > thr ? 1 : 0;
+  const veg0 = new Uint8Array(N);
+  let vegCount0 = 0;
+  for (let p = 0; p < N; p++) {
+    if (exg[p] > vegThr) { veg0[p] = 1; vegCount0++; }
+  }
+  // Safety: if Otsu collapsed everything to one side (no soil or no veg),
+  // fall back to a relative threshold so we always have all three classes.
+  if (vegCount0 / N > 0.95 || vegCount0 / N < 0.02) {
+    const fallback = exgMin + (exgMax - exgMin) * 0.45;
+    vegCount0 = 0;
+    for (let p = 0; p < N; p++) {
+      veg0[p] = exg[p] > fallback ? 1 : 0;
+      if (veg0[p]) vegCount0++;
+    }
+  }
 
-  // Light morphological opening to clean speckles, keep crop rows intact.
-  let cleaned = morph(veg, w, h, "erode", 1);
+  // Light open: erode then dilate removes single-pixel noise but preserves rows.
+  let cleaned = morph(veg0, w, h, "erode", 1);
   cleaned = morph(cleaned, w, h, "dilate", 1);
 
   let vegTotal = 0;
   for (let p = 0; p < N; p++) if (cleaned[p]) vegTotal++;
 
-  // ---------- Step 3: connected components + bounding boxes ----------
+  // ---------- Step 3: crop vs weed split within vegetation ----------
+  // Build an array of ExG values for vegetation pixels only and run Otsu
+  // again. Crop tends to have a *higher* ExG (denser, healthier green);
+  // weed patches are typically paler / sparser and sit below the split.
+  const vegIdx = new Int32Array(vegTotal);
+  let k = 0;
+  for (let p = 0; p < N; p++) if (cleaned[p]) vegIdx[k++] = p;
+
+  let vegExgMin = Infinity, vegExgMax = -Infinity;
+  for (let i = 0; i < vegTotal; i++) {
+    const v = exg[vegIdx[i]];
+    if (v < vegExgMin) vegExgMin = v;
+    if (v > vegExgMax) vegExgMax = v;
+  }
+  const cropThr = vegTotal > 0
+    ? otsuThreshold(exg, vegIdx, vegExgMin, vegExgMax)
+    : 0;
+
+  // Per-pixel "looks like crop" cue (strong green) vs "looks like weed" (weak green).
+  const cropCue = new Uint8Array(N);
+  for (let p = 0; p < N; p++) if (cleaned[p] && exg[p] >= cropThr) cropCue[p] = 1;
+
+  // ---------- Step 4: connected components + per-component classification ----------
   const { labels, sizes } = connectedComponents(cleaned, w, h);
   const NC = sizes.length;
-  const minX = new Int32Array(NC); const maxX = new Int32Array(NC);
-  const minY = new Int32Array(NC); const maxY = new Int32Array(NC);
-  for (let id = 0; id < NC; id++) { minX[id] = w; minY[id] = h; maxX[id] = 0; maxY[id] = 0; }
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const id = labels[y * w + x];
-      if (!id) continue;
-      if (x < minX[id]) minX[id] = x;
-      if (x > maxX[id]) maxX[id] = x;
-      if (y < minY[id]) minY[id] = y;
-      if (y > maxY[id]) maxY[id] = y;
-    }
-  }
-
-  // ---------- Step 4: row detection via column histogram ----------
-  // Crops typically sit in vertical rows; project vegetation along columns
-  // and again along rows so we detect whichever orientation dominates.
-  const colHist = new Int32Array(w);
-  const rowHist = new Int32Array(h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (cleaned[y * w + x]) { colHist[x]++; rowHist[y]++; }
-    }
-  }
-  const smoothLine = (arr: Int32Array, len: number, radius: number) => {
-    const out = new Float32Array(len);
-    for (let i = 0; i < len; i++) {
-      let s = 0, c = 0;
-      const a = Math.max(0, i - radius), b = Math.min(len - 1, i + radius);
-      for (let k = a; k <= b; k++) { s += arr[k]; c++; }
-      out[i] = s / c;
-    }
-    return out;
-  };
-  const SR = Math.max(2, Math.round(Math.min(w, h) * 0.012));
-  const colS = smoothLine(colHist, w, SR);
-  const rowS = smoothLine(rowHist, h, SR);
-  const meanStd = (arr: Float32Array) => {
-    let m = 0; for (let i = 0; i < arr.length; i++) m += arr[i]; m /= arr.length;
-    let v = 0; for (let i = 0; i < arr.length; i++) { const d = arr[i] - m; v += d * d; }
-    return { m, s: Math.sqrt(v / arr.length) };
-  };
-  const cs = meanStd(colS), rs = meanStd(rowS);
-  // Whichever axis has stronger variance is the "across rows" axis (rows are perpendicular).
-  const colVariation = cs.s / (cs.m || 1);
-  const rowVariation = rs.s / (rs.m || 1);
-  const useCols = colVariation >= rowVariation;
-  const lineArr = useCols ? colS : rowS;
-  const lineLen = useCols ? w : h;
-  const lineStat = useCols ? cs : rs;
-  const rowCut = lineStat.m + 0.15 * lineStat.s;
-  const inRow = new Uint8Array(lineLen);
-  for (let i = 0; i < lineLen; i++) inRow[i] = lineArr[i] >= rowCut ? 1 : 0;
-
-  // ---------- Step 5: classify components ----------
-  // crop = large, row-aligned. weed = small / isolated / off-row patches.
-  const cropMinSize = Math.max(
-    settings.minPatch * 4,
-    Math.floor(N * (0.0035 - sens * 0.002)), // 0.0015..0.0035 fraction
-  );
-  // 0=unused, 1=crop, 2=weed
-  const compClass = new Uint8Array(NC);
-  for (let id = 1; id < NC; id++) {
-    const s = sizes[id];
-    if (s === 0) { continue; }
-    const bw = maxX[id] - minX[id] + 1;
-    const bh = maxY[id] - minY[id] + 1;
-    const fill = s / (bw * bh);
-    // How much of the component's bbox sits inside detected crop rows.
-    let rowHit = 0, rowAll = 0;
-    if (useCols) {
-      for (let x = minX[id]; x <= maxX[id]; x++) { rowAll++; if (inRow[x]) rowHit++; }
-    } else {
-      for (let y = minY[id]; y <= maxY[id]; y++) { rowAll++; if (inRow[y]) rowHit++; }
-    }
-    const rowOverlap = rowAll ? rowHit / rowAll : 0;
-    // Elongation along the row direction is another crop cue.
-    const elong = useCols ? bh / Math.max(1, bw) : bw / Math.max(1, bh);
-
-    const looksLikeCrop =
-      s >= cropMinSize &&
-      (rowOverlap >= 0.45 || elong >= 1.6 || fill >= 0.45);
-
-    compClass[id] = looksLikeCrop ? 1 : 2;
-  }
-
-  // ---------- Step 6: per-pixel classification ----------
-  // Inside a crop component, pixels that fall in non-row columns are
-  // treated as interrow weeds. Inside a weed component, every pixel is weed.
-  const classMask = new Uint8Array(N); // 0 soil, 1 crop, 2 weed
+  const compExgSum = new Float64Array(NC);
+  const compCropCue = new Int32Array(NC);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const p = y * w + x;
-      if (!cleaned[p]) { classMask[p] = 0; continue; }
       const id = labels[p];
-      const cc = compClass[id];
-      if (cc === 1) {
-        const inside = useCols ? inRow[x] : inRow[y];
-        classMask[p] = inside ? 1 : 2;
-      } else {
-        classMask[p] = 2;
-      }
+      if (!id) continue;
+      compExgSum[id] += exg[p];
+      if (cropCue[p]) compCropCue[id]++;
+    }
+  }
+
+  // Component-level decision:
+  //   - Small isolated component  → WEED (irregular, unwanted patch)
+  //   - Large + mostly strong-green pixels → CROP (healthy continuous mass)
+  //   - Large but pale (low cropCue ratio) → WEED (off-color patch)
+  // `smallThr` adapts to the image size so it works for any resolution.
+  const smallThr = Math.max(40, Math.floor(N * 0.0015));
+  // 0 = unused, 1 = crop, 2 = weed
+  const compClass = new Uint8Array(NC);
+  for (let id = 1; id < NC; id++) {
+    const s = sizes[id];
+    if (s === 0) continue;
+    if (s < smallThr) { compClass[id] = 2; continue; }
+    const cueRatio = compCropCue[id] / s;
+    compClass[id] = cueRatio >= 0.5 ? 1 : 2;
+  }
+
+  // ---------- Step 5: per-pixel class mask ----------
+  // Inside a crop component, any pixel that fails the strong-green cue is
+  // treated as an inter-row weed pixel. Inside a weed component everything
+  // is weed. Outside vegetation → soil.
+  const classMask = new Uint8Array(N); // 0 soil, 1 crop, 2 weed
+  for (let p = 0; p < N; p++) {
+    if (!cleaned[p]) { classMask[p] = 0; continue; }
+    const cc = compClass[labels[p]];
+    if (cc === 1) {
+      classMask[p] = cropCue[p] ? 1 : 2;
+    } else {
+      classMask[p] = 2;
     }
   }
 
   const countClasses = () => {
-    let c = 0, wd = 0, sl = 0;
+    let cc = 0, wd = 0, sl = 0;
     for (let p = 0; p < N; p++) {
       const v = classMask[p];
-      if (v === 1) c++; else if (v === 2) wd++; else sl++;
+      if (v === 1) cc++; else if (v === 2) wd++; else sl++;
     }
-    return { c, wd, sl };
+    return { c: cc, wd, sl };
   };
   let cnt = countClasses();
 
-  // ---------- Step 7: safety rails so output never collapses to one color ----------
-  // 7a) Too much weed relative to vegetation → promote biggest weed components to crop.
-  if (vegTotal > 0 && cnt.wd / vegTotal > 0.6) {
+  // ---------- Step 6: safety rails so output never collapses to one color ----------
+  // 6a) If weed dominates vegetation (>65%), the largest weed component is
+  //     almost certainly the main crop mass — promote it back to crop.
+  if (vegTotal > 0 && cnt.wd / vegTotal > 0.65) {
     const weedIds: number[] = [];
     for (let id = 1; id < NC; id++) if (compClass[id] === 2) weedIds.push(id);
     weedIds.sort((a, b) => sizes[b] - sizes[a]);
     for (const id of weedIds) {
-      if (sizes[id] < cropMinSize / 2) break;
+      if (sizes[id] < smallThr) break;
       compClass[id] = 1;
-      for (let p = 0; p < N; p++) if (labels[p] === id) classMask[p] = 1;
+      for (let p = 0; p < N; p++) if (labels[p] === id) classMask[p] = cropCue[p] ? 1 : 2;
       cnt = countClasses();
-      if (cnt.wd / vegTotal <= 0.35) break;
+      if (cnt.wd / vegTotal <= 0.4) break;
     }
   }
 
-  // 7b) Almost no weed detected but plenty of small isolated components exist →
-  //     reclassify the smallest crop components (below row band) as weed.
+  // 6b) If virtually no weed was found but small isolated components exist,
+  //     mark the smallest of them as weed so output shows all three classes.
   if (vegTotal > 0 && cnt.wd / vegTotal < 0.02) {
     const cropIds: number[] = [];
-    for (let id = 1; id < NC; id++) if (compClass[id] === 1 && sizes[id] < cropMinSize) cropIds.push(id);
+    for (let id = 1; id < NC; id++) if (compClass[id] === 1 && sizes[id] < smallThr * 4) cropIds.push(id);
     cropIds.sort((a, b) => sizes[a] - sizes[b]);
     for (const id of cropIds) {
       compClass[id] = 2;
       for (let p = 0; p < N; p++) if (labels[p] === id) classMask[p] = 2;
       cnt = countClasses();
-      if (cnt.wd / vegTotal >= 0.05) break;
+      if (cnt.wd / vegTotal >= 0.04) break;
     }
   }
 
-  // 7c) Hard cap: if vegetation covers >95% of the image, restore the weakest
-  //     vegetation pixels to soil so brown is always visible somewhere.
+  // 6c) Hard cap: if vegetation covers >95% of the image, restore the weakest
+  //     vegetation pixels back to soil so brown is always visible somewhere.
   if (vegTotal / N > 0.95) {
     const target = Math.floor(N * 0.9);
     const sorted = Array.from(exg).map((v, i) => [v, i] as [number, number]);
@@ -332,12 +318,12 @@ async function processImage(file: File, settings: Settings): Promise<Result> {
     cnt = countClasses();
   }
 
-  // ---------- Step 8: render overlay ----------
+  // ---------- Step 7: render overlay ----------
   const out = ctx.createImageData(w, h);
   const cells = Array.from({ length: 64 }, () => ({ weed: 0, total: 0 }));
   const cw = w / 8, ch = h / 8;
   let crop = 0, weed = 0, soil = 0;
-  const ALPHA = 0.25 + strength * 0.5;
+  const ALPHA = 0.55; // fixed overlay opacity, no user control needed
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -389,16 +375,15 @@ function DashboardPage() {
   const [result, setResult] = useState<Result | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [settings, setSettings] = useState<Settings>(RECOMMENDED);
   const inputRef = useRef<HTMLInputElement>(null);
   const runIdRef = useRef(0);
 
-  const runProcess = useCallback(async (f: File, s: Settings) => {
+  const runProcess = useCallback(async (f: File) => {
     const id = ++runIdRef.current;
     setLoading(true);
     setError(null);
     try {
-      const r = await processImage(f, s);
+      const r = await processImage(f);
       if (id === runIdRef.current) setResult(r);
     } catch (e: any) {
       if (id === runIdRef.current) setError(e?.message ?? "Failed to process image.");
@@ -416,16 +401,8 @@ function DashboardPage() {
     setFile(f);
     setOriginalUrl(URL.createObjectURL(f));
     setResult(null);
-    runProcess(f, settings);
-  }, [runProcess, settings]);
-
-  // Re-run when settings change (debounced) and a file is loaded.
-  useEffect(() => {
-    if (!file) return;
-    const t = setTimeout(() => runProcess(file, settings), 180);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings, file]);
+    runProcess(f);
+  }, [runProcess]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -490,47 +467,6 @@ function DashboardPage() {
           {file && <p className="mt-3 text-xs text-muted-foreground">Selected: {file.name}</p>}
           {error && <p className="mt-3 text-sm text-[var(--weed)] font-semibold">{error}</p>}
         </div>
-
-        {/* Tuning controls */}
-        {file && (
-          <div className="rounded-3xl bg-card border border-border p-6 shadow-card">
-            <div className="flex items-center justify-between mb-5 gap-3 flex-wrap">
-              <div className="flex items-center gap-2">
-                <Sliders className="h-5 w-5 text-primary" />
-                <h3 className="font-display font-bold text-lg">Segmentation controls</h3>
-              </div>
-              <button
-                onClick={() => setSettings(RECOMMENDED)}
-                className="inline-flex items-center gap-2 rounded-full bg-secondary hover:bg-secondary/80 px-4 py-2 text-sm font-semibold transition"
-              >
-                <RotateCcw className="h-4 w-4" /> Use Recommended Settings
-              </button>
-            </div>
-            <div className="grid md:grid-cols-3 gap-6">
-              <SliderRow
-                label="Weed Sensitivity"
-                value={settings.sensitivity}
-                min={0} max={100} step={1}
-                onChange={(v) => setSettings((s) => ({ ...s, sensitivity: v }))}
-                hint="Higher = detects more weed pixels"
-              />
-              <SliderRow
-                label="Min Weed Patch Size"
-                value={settings.minPatch}
-                min={5} max={300} step={5}
-                onChange={(v) => setSettings((s) => ({ ...s, minPatch: v }))}
-                hint="Drops tiny red speckles"
-              />
-              <SliderRow
-                label="Segmentation Strength"
-                value={settings.strength}
-                min={0} max={100} step={1}
-                onChange={(v) => setSettings((s) => ({ ...s, strength: v }))}
-                hint="Overlay opacity & cleanup"
-              />
-            </div>
-          </div>
-        )}
 
         {loading && (
           <div className="rounded-2xl bg-card border border-border p-8 flex items-center gap-3 justify-center shadow-card">
@@ -598,28 +534,6 @@ function DashboardPage() {
           Green-Scanner | AI for Precision Agriculture
         </div>
       </footer>
-    </div>
-  );
-}
-
-function SliderRow({
-  label, value, min, max, step, onChange, hint,
-}: {
-  label: string; value: number; min: number; max: number; step: number;
-  onChange: (v: number) => void; hint?: string;
-}) {
-  return (
-    <div>
-      <div className="flex items-baseline justify-between mb-2">
-        <span className="text-sm font-semibold">{label}</span>
-        <span className="text-xs font-mono text-muted-foreground">{value}</span>
-      </div>
-      <Slider
-        value={[value]}
-        min={min} max={max} step={step}
-        onValueChange={(v) => onChange(v[0])}
-      />
-      {hint && <p className="text-xs text-muted-foreground mt-2">{hint}</p>}
     </div>
   );
 }
