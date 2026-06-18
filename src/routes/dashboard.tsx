@@ -538,28 +538,6 @@ function DashboardPage() {
   );
 }
 
-function SliderRow({
-  label, value, min, max, step, onChange, hint,
-}: {
-  label: string; value: number; min: number; max: number; step: number;
-  onChange: (v: number) => void; hint?: string;
-}) {
-  return (
-    <div>
-      <div className="flex items-baseline justify-between mb-2">
-        <span className="text-sm font-semibold">{label}</span>
-        <span className="text-xs font-mono text-muted-foreground">{value}</span>
-      </div>
-      <Slider
-        value={[value]}
-        min={min} max={max} step={step}
-        onValueChange={(v) => onChange(v[0])}
-      />
-      {hint && <p className="text-xs text-muted-foreground mt-2">{hint}</p>}
-    </div>
-  );
-}
-
 function Panel({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="rounded-3xl bg-card border border-border shadow-card overflow-hidden">
