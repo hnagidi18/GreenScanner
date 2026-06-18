@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   Leaf, Upload, Image as ImageIcon, Droplets, Sprout, BarChart3,
   TrendingDown, Grid3x3, ArrowLeft, Loader2, Sparkles,
