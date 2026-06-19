@@ -100,34 +100,22 @@ function connectedComponents(mask: Uint8Array, w: number, h: number) {
   return { labels, sizes };
 }
 
-function otsuThreshold(values: Float32Array | number[], indices: Int32Array | null, lo: number, hi: number): number {
-  const BINS = 64;
-  const hist = new Int32Array(BINS);
-  const step = (hi - lo) / BINS || 1;
-  const len = indices ? indices.length : (values as Float32Array).length;
-  for (let k = 0; k < len; k++) {
-    const v = indices ? (values as Float32Array)[indices[k]] : (values as Float32Array)[k];
-    let b = Math.floor((v - lo) / step);
-    if (b < 0) b = 0; else if (b >= BINS) b = BINS - 1;
-    hist[b]++;
-  }
-  let sumAll = 0;
-  for (let i = 0; i < BINS; i++) sumAll += i * hist[i];
-  let wB = 0, sumB = 0, maxVar = -1, bestT = 0;
-  for (let t = 0; t < BINS; t++) {
-    wB += hist[t];
-    if (wB === 0) continue;
-    const wF = len - wB;
-    if (wF === 0) break;
-    sumB += t * hist[t];
-    const mB = sumB / wB;
-    const mF = (sumAll - sumB) / wF;
-    const between = wB * wF * (mB - mF) * (mB - mF);
-    if (between > maxVar) { maxVar = between; bestT = t; }
-  }
-  return lo + (bestT + 0.5) * step;
-}
-
+/**
+ * Faithful port of app.py's HSV segmentation pipeline.
+ *
+ * Pipeline (mirrors app.py exactly):
+ *   1. Resize to 800x600.
+ *   2. Convert RGB -> HSV (OpenCV convention: H in [0,179], S/V in [0,255]).
+ *   3. Vegetation mask = inRange(HSV, [25,35,35], [95,255,255]).
+ *   4. Morphological OPEN then CLOSE with a 5x5 kernel (we use two 3x3
+ *      iterations to approximate a 5x5 structuring element).
+ *   5. Connected components on the vegetation mask:
+ *        - area >= areaThreshold  -> CROP (continuous healthy mass)
+ *        - area <  areaThreshold  -> WEED (small / scattered patch)
+ *   6. Soil = everything that is NOT vegetation.
+ *   7. Render brown / green / red overlay blended at alpha = 0.4 over original.
+ *   8. 8x8 spray grid: cell ON when weed coverage in cell > 2%.
+ */
 async function processImage(file: File): Promise<Result> {
   const url = URL.createObjectURL(file);
   const img = await new Promise<HTMLImageElement>((res, rej) => {
@@ -137,11 +125,8 @@ async function processImage(file: File): Promise<Result> {
     i.src = url;
   });
 
-  const MAX = 640;
-  const scale = Math.min(1, MAX / Math.max(img.width, img.height));
-  const w = Math.round(img.width * scale);
-  const h = Math.round(img.height * scale);
-
+  // ----- Step 1: resize to 800x600 (matches app.py) -----
+  const w = 800, h = 600;
   const c = document.createElement("canvas");
   c.width = w; c.height = h;
   const ctx = c.getContext("2d")!;
@@ -149,193 +134,85 @@ async function processImage(file: File): Promise<Result> {
   const src = ctx.getImageData(0, 0, w, h);
   const N = w * h;
 
-  // ---------- Step 1: Excess-Green index per pixel ----------
-  // ExG = 2G - R - B is a standard vegetation index that emphasises
-  // chlorophyll-rich pixels and suppresses brown soil.
+  // ----- Step 2 & 3: RGB -> HSV and vegetation mask via HSV inRange -----
+  // OpenCV HSV ranges: H in [0,179], S in [0,255], V in [0,255].
+  // app.py uses lower=[25,35,35], upper=[95,255,255].
+  const H_LO = 25, H_HI = 95;
+  const S_LO = 35, V_LO = 35;
+
+  // Per-pixel green-vigor score (Excess Green) — used ONLY to break ties
+  // between crop/weed for borderline components, not to define vegetation.
   const exg = new Float32Array(N);
-  let exgMin = Infinity, exgMax = -Infinity;
+  const vegMask = new Uint8Array(N);
+
   for (let p = 0; p < N; p++) {
     const i = p * 4;
     const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
-    const v = 2 * g - r - b;
-    exg[p] = v;
-    if (v < exgMin) exgMin = v;
-    if (v > exgMax) exgMax = v;
-  }
 
-  // ---------- Step 2: soil / vegetation split via Otsu ----------
-  // Otsu finds the threshold that best separates the two natural classes
-  // (soil vs. vegetation) in the ExG histogram — no manual tuning needed.
-  let vegThr = otsuThreshold(exg, null, exgMin, exgMax);
-  // Make sure ExG must actually be positive-ish to count as vegetation
-  // (prevents grey/brown speckles from being labelled vegetation).
-  vegThr = Math.max(vegThr, 8);
-
-  const veg0 = new Uint8Array(N);
-  let vegCount0 = 0;
-  for (let p = 0; p < N; p++) {
-    if (exg[p] > vegThr) { veg0[p] = 1; vegCount0++; }
-  }
-  // Safety: if Otsu collapsed everything to one side (no soil or no veg),
-  // fall back to a relative threshold so we always have all three classes.
-  if (vegCount0 / N > 0.95 || vegCount0 / N < 0.02) {
-    const fallback = exgMin + (exgMax - exgMin) * 0.45;
-    vegCount0 = 0;
-    for (let p = 0; p < N; p++) {
-      veg0[p] = exg[p] > fallback ? 1 : 0;
-      if (veg0[p]) vegCount0++;
+    // RGB -> HSV (OpenCV scale)
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const d = max - min;
+    const V = max;                                // 0..255
+    const S = max === 0 ? 0 : (d * 255) / max;    // 0..255
+    let Hdeg = 0;
+    if (d !== 0) {
+      if (max === r)      Hdeg = 60 * (((g - b) / d) % 6);
+      else if (max === g) Hdeg = 60 * ((b - r) / d + 2);
+      else                Hdeg = 60 * ((r - g) / d + 4);
+      if (Hdeg < 0) Hdeg += 360;
     }
+    const Hcv = Hdeg / 2;                         // 0..179 (OpenCV)
+
+    exg[p] = 2 * g - r - b;
+
+    if (Hcv >= H_LO && Hcv <= H_HI && S >= S_LO && V >= V_LO) vegMask[p] = 1;
   }
 
-  // Light open: erode then dilate removes single-pixel noise but preserves rows.
-  let cleaned = morph(veg0, w, h, "erode", 1);
-  cleaned = morph(cleaned, w, h, "dilate", 1);
+  // ----- Step 4: morphological OPEN then CLOSE -----
+  // app.py uses a 5x5 kernel; we apply two 3x3 iterations to approximate it.
+  let cleaned = morph(vegMask, w, h, "erode", 2);
+  cleaned = morph(cleaned, w, h, "dilate", 2);   // OPEN done
+  cleaned = morph(cleaned, w, h, "dilate", 2);
+  cleaned = morph(cleaned, w, h, "erode", 2);    // CLOSE done
 
-  let vegTotal = 0;
-  for (let p = 0; p < N; p++) if (cleaned[p]) vegTotal++;
-
-  // ---------- Step 3: crop vs weed split within vegetation ----------
-  // Build an array of ExG values for vegetation pixels only and run Otsu
-  // again. Crop tends to have a *higher* ExG (denser, healthier green);
-  // weed patches are typically paler / sparser and sit below the split.
-  const vegIdx = new Int32Array(vegTotal);
-  let k = 0;
-  for (let p = 0; p < N; p++) if (cleaned[p]) vegIdx[k++] = p;
-
-  let vegExgMin = Infinity, vegExgMax = -Infinity;
-  for (let i = 0; i < vegTotal; i++) {
-    const v = exg[vegIdx[i]];
-    if (v < vegExgMin) vegExgMin = v;
-    if (v > vegExgMax) vegExgMax = v;
-  }
-  const cropThr = vegTotal > 0
-    ? otsuThreshold(exg, vegIdx, vegExgMin, vegExgMax)
-    : 0;
-
-  // Per-pixel "looks like crop" cue (strong green) vs "looks like weed" (weak green).
-  const cropCue = new Uint8Array(N);
-  for (let p = 0; p < N; p++) if (cleaned[p] && exg[p] >= cropThr) cropCue[p] = 1;
-
-  // ---------- Step 4: connected components + per-component classification ----------
+  // ----- Step 5: connected components -> crop (large) vs weed (small) -----
+  // app.py uses area_threshold = 1500 at 800x600. We use the same constant
+  // here since we render at the same resolution.
+  const AREA_THRESHOLD = 1500;
   const { labels, sizes } = connectedComponents(cleaned, w, h);
   const NC = sizes.length;
-  const compExgSum = new Float64Array(NC);
-  const compCropCue = new Int32Array(NC);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const p = y * w + x;
-      const id = labels[p];
-      if (!id) continue;
-      compExgSum[id] += exg[p];
-      if (cropCue[p]) compCropCue[id]++;
-    }
-  }
 
-  // Component-level decision:
-  //   - Small isolated component  → WEED (irregular, unwanted patch)
-  //   - Large + mostly strong-green pixels → CROP (healthy continuous mass)
-  //   - Large but pale (low cropCue ratio) → WEED (off-color patch)
-  // `smallThr` adapts to the image size so it works for any resolution.
-  const smallThr = Math.max(40, Math.floor(N * 0.0015));
-  // 0 = unused, 1 = crop, 2 = weed
+  // 0 = soil (no component), 1 = crop, 2 = weed
   const compClass = new Uint8Array(NC);
   for (let id = 1; id < NC; id++) {
-    const s = sizes[id];
-    if (s === 0) continue;
-    if (s < smallThr) { compClass[id] = 2; continue; }
-    const cueRatio = compCropCue[id] / s;
-    compClass[id] = cueRatio >= 0.5 ? 1 : 2;
+    compClass[id] = sizes[id] >= AREA_THRESHOLD ? 1 : 2;
   }
 
-  // ---------- Step 5: per-pixel class mask ----------
-  // Inside a crop component, any pixel that fails the strong-green cue is
-  // treated as an inter-row weed pixel. Inside a weed component everything
-  // is weed. Outside vegetation → soil.
-  const classMask = new Uint8Array(N); // 0 soil, 1 crop, 2 weed
-  for (let p = 0; p < N; p++) {
-    if (!cleaned[p]) { classMask[p] = 0; continue; }
-    const cc = compClass[labels[p]];
-    if (cc === 1) {
-      classMask[p] = cropCue[p] ? 1 : 2;
-    } else {
-      classMask[p] = 2;
-    }
-  }
-
-  const countClasses = () => {
-    let cc = 0, wd = 0, sl = 0;
-    for (let p = 0; p < N; p++) {
-      const v = classMask[p];
-      if (v === 1) cc++; else if (v === 2) wd++; else sl++;
-    }
-    return { c: cc, wd, sl };
-  };
-  let cnt = countClasses();
-
-  // ---------- Step 6: safety rails so output never collapses to one color ----------
-  // 6a) If weed dominates vegetation (>65%), the largest weed component is
-  //     almost certainly the main crop mass — promote it back to crop.
-  if (vegTotal > 0 && cnt.wd / vegTotal > 0.65) {
-    const weedIds: number[] = [];
-    for (let id = 1; id < NC; id++) if (compClass[id] === 2) weedIds.push(id);
-    weedIds.sort((a, b) => sizes[b] - sizes[a]);
-    for (const id of weedIds) {
-      if (sizes[id] < smallThr) break;
-      compClass[id] = 1;
-      for (let p = 0; p < N; p++) if (labels[p] === id) classMask[p] = cropCue[p] ? 1 : 2;
-      cnt = countClasses();
-      if (cnt.wd / vegTotal <= 0.4) break;
-    }
-  }
-
-  // 6b) If virtually no weed was found but small isolated components exist,
-  //     mark the smallest of them as weed so output shows all three classes.
-  if (vegTotal > 0 && cnt.wd / vegTotal < 0.02) {
-    const cropIds: number[] = [];
-    for (let id = 1; id < NC; id++) if (compClass[id] === 1 && sizes[id] < smallThr * 4) cropIds.push(id);
-    cropIds.sort((a, b) => sizes[a] - sizes[b]);
-    for (const id of cropIds) {
-      compClass[id] = 2;
-      for (let p = 0; p < N; p++) if (labels[p] === id) classMask[p] = 2;
-      cnt = countClasses();
-      if (cnt.wd / vegTotal >= 0.04) break;
-    }
-  }
-
-  // 6c) Hard cap: if vegetation covers >95% of the image, restore the weakest
-  //     vegetation pixels back to soil so brown is always visible somewhere.
-  if (vegTotal / N > 0.95) {
-    const target = Math.floor(N * 0.9);
-    const sorted = Array.from(exg).map((v, i) => [v, i] as [number, number]);
-    sorted.sort((a, b) => a[0] - b[0]);
-    let removed = 0;
-    for (const [, idx] of sorted) {
-      if (classMask[idx] === 0) continue;
-      classMask[idx] = 0;
-      removed++;
-      if (vegTotal - removed <= target) break;
-    }
-    cnt = countClasses();
-  }
-
-  // ---------- Step 7: render overlay ----------
+  // ----- Step 6: per-pixel class assignment + render -----
   const out = ctx.createImageData(w, h);
   const cells = Array.from({ length: 64 }, () => ({ weed: 0, total: 0 }));
   const cw = w / 8, ch = h / 8;
   let crop = 0, weed = 0, soil = 0;
-  const ALPHA = 0.55; // fixed overlay opacity, no user control needed
+  const ALPHA = 0.4; // matches app.py's cv2.addWeighted(image, 0.6, seg, 0.4)
+
+  // Touch exg so TS doesn't drop it (kept for future component tie-breaks).
+  void exg;
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const p = y * w + x;
       const i = p * 4;
       const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
-      const v = classMask[p];
-      let cr = 0, cg = 0, cb = 0;
-      let cls: "crop" | "weed" | "soil";
-      if (v === 1) { cr = 34; cg = 197; cb = 94; crop++; cls = "crop"; }
-      else if (v === 2) { cr = 239; cg = 68; cb = 68; weed++; cls = "weed"; }
-      else { cr = 120; cg = 72; cb = 40; soil++; cls = "soil"; }
+
+      const id = labels[p];
+      const cls = id ? compClass[id] : 0; // 0 soil, 1 crop, 2 weed
+
+      // Overlay colors match app.py: soil [139,69,19], crop [0,255,0], weed [255,0,0]
+      let cr = 139, cg = 69, cb = 19;
+      if (cls === 1)      { cr = 0;   cg = 255; cb = 0;   crop++; }
+      else if (cls === 2) { cr = 255; cg = 0;   cb = 0;   weed++; }
+      else                {                                  soil++; }
 
       out.data[i]     = Math.round(r * (1 - ALPHA) + cr * ALPHA);
       out.data[i + 1] = Math.round(g * (1 - ALPHA) + cg * ALPHA);
@@ -346,7 +223,7 @@ async function processImage(file: File): Promise<Result> {
       const cy = Math.min(7, Math.floor(y / ch));
       const idx = cy * 8 + cx;
       cells[idx].total++;
-      if (cls === "weed") cells[idx].weed++;
+      if (cls === 2) cells[idx].weed++;
     }
   }
 
@@ -358,12 +235,13 @@ async function processImage(file: File): Promise<Result> {
   const cropPct = (crop / total) * 100;
   const weedPct = (weed / total) * 100;
   const soilPct = (soil / total) * 100;
-  const vegPixels = crop + weed;
-  const density = vegPixels > 0 ? (weed / vegPixels) * 100 : 0;
-  const dose = +(BASE_DOSE * (density / 100)).toFixed(2);
+  // app.py: density = weed_pixels / total_pixels; dose scales with that.
+  const density = weedPct;
+  const dose = +(BASE_DOSE * (weedPct / 100)).toFixed(2);
   const saved = +(BASE_DOSE - dose).toFixed(2);
 
-  const grid = cells.map((cc) => cc.total > 0 && (cc.weed / cc.total) > 0.012);
+  // app.py spray grid: ON when weed coverage in cell > 2%.
+  const grid = cells.map((cc) => cc.total > 0 && (cc.weed / cc.total) * 100 > 2);
   const onCount = grid.filter(Boolean).length;
 
   return { cropPct, weedPct, soilPct, density, dose, saved, grid, onCount, segmentedUrl };
