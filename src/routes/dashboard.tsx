@@ -226,35 +226,6 @@ async function processImage(file: File): Promise<Result> {
       if (cls === 2) cells[idx].weed++;
     }
   }
-  const cells = Array.from({ length: 64 }, () => ({ weed: 0, total: 0 }));
-  const cw = w / 8, ch = h / 8;
-  let crop = 0, weed = 0, soil = 0;
-  const ALPHA = 0.55; // fixed overlay opacity, no user control needed
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const p = y * w + x;
-      const i = p * 4;
-      const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
-      const v = classMask[p];
-      let cr = 0, cg = 0, cb = 0;
-      let cls: "crop" | "weed" | "soil";
-      if (v === 1) { cr = 34; cg = 197; cb = 94; crop++; cls = "crop"; }
-      else if (v === 2) { cr = 239; cg = 68; cb = 68; weed++; cls = "weed"; }
-      else { cr = 120; cg = 72; cb = 40; soil++; cls = "soil"; }
-
-      out.data[i]     = Math.round(r * (1 - ALPHA) + cr * ALPHA);
-      out.data[i + 1] = Math.round(g * (1 - ALPHA) + cg * ALPHA);
-      out.data[i + 2] = Math.round(b * (1 - ALPHA) + cb * ALPHA);
-      out.data[i + 3] = 255;
-
-      const cx = Math.min(7, Math.floor(x / cw));
-      const cy = Math.min(7, Math.floor(y / ch));
-      const idx = cy * 8 + cx;
-      cells[idx].total++;
-      if (cls === "weed") cells[idx].weed++;
-    }
-  }
 
   ctx.putImageData(out, 0, 0);
   const segmentedUrl = c.toDataURL("image/jpeg", 0.9);
