@@ -593,14 +593,14 @@ function SprayGrid() {
 
 function Tech() {
   const tech = [
-    { n: "Python", d: "Core programming language used for image analysis, data processing, and recommendation generation.", i: Code2 },
-    { n: "OpenCV", d: "Used for image preprocessing, vegetation detection, and crop/weed/soil segmentation.", i: Eye },
-    { n: "NumPy", d: "Used for pixel-level calculations, density estimation, and numerical operations.", i: Calculator },
-    { n: "Pandas", d: "Used for organizing analysis results and generating reports.", i: Database },
-    { n: "Matplotlib", d: "Used for spray grid visualization and graphical outputs.", i: LineChart },
-    { n: "Streamlit", d: "Used to build the interactive web-based dashboard.", i: Monitor },
-    { n: "Computer Vision", d: "Used to identify crop, weed, and soil regions from aerial images.", i: ScanLine },
-    { n: "AI / ML", d: "Used for intelligent weed analysis and precision agriculture decision support.", i: Brain },
+    { n: "Python", d: "Core language powering the training pipeline, segmentation backend, and metrics engine.", i: Code2 },
+    { n: "PyTorch", d: "Deep-learning framework used to train and run the U-Net crop/weed/soil segmentation model.", i: Brain },
+    { n: "U-Net (3-class)", d: "Semantic segmentation architecture trained to label every pixel as soil, crop, or weed.", i: Layers },
+    { n: "Albumentations", d: "Image augmentation pipeline (flips, rotations, color jitter) used during U-Net training.", i: Sparkles },
+    { n: "OpenCV", d: "Used for image I/O, resizing, mask post-processing, and overlay rendering.", i: Eye },
+    { n: "NumPy", d: "Pixel-level math for class masks, coverage ratios, and spray-grid calculations.", i: Calculator },
+    { n: "Streamlit", d: "Python dashboard for uploading aerial images and viewing segmentation results.", i: Monitor },
+    { n: "TanStack Start + React", d: "TypeScript frontend that renders the marketing site and the in-browser analyzer.", i: Code2 },
   ];
   return (
     <Section id="tech" eyebrow="Technology" title="Built on a proven open-source stack">
@@ -623,12 +623,12 @@ function Tech() {
 
 function FutureEnhancements() {
   const items = [
-    { t: "U-Net Integration", d: "Advanced semantic segmentation for improved crop and weed classification.", i: Layers },
-    { t: "DeepLabV3+ Detection", d: "More accurate weed detection using modern segmentation architectures.", i: Brain },
-    { t: "Real-Time Drone Processing", d: "Direct processing of live aerial images captured by drones.", i: Rocket },
-    { t: "Cloud Deployment", d: "Public URL access and cloud-based scalability.", i: Cloud },
-    { t: "Mobile Application", d: "Access Green-Scanner features through Android and iOS devices.", i: Smartphone },
-    { t: "GPS-Enabled Precision Spraying", d: "Location-aware spray planning for smart farming systems.", i: MapPin },
+    { t: "DeepLabV3+ & Transformer Models", d: "Benchmark U-Net against DeepLabV3+ and SegFormer backbones for higher mIoU on dense weed patches.", i: Brain },
+    { t: "Larger Field Dataset", d: "Expand training beyond CoFly-WeedDB with multi-crop, multi-season UAV imagery to improve generalisation.", i: Layers },
+    { t: "Real-Time Drone Streaming", d: "On-board inference on live UAV video feeds instead of post-flight image uploads.", i: Rocket },
+    { t: "Edge Deployment", d: "Quantised U-Net running on Jetson / Coral devices mounted directly on the sprayer.", i: Cloud },
+    { t: "Mobile Companion App", d: "Android and iOS app for field scouting, capture, and spray-plan review.", i: Smartphone },
+    { t: "GPS-Linked Variable-Rate Spraying", d: "Map each 8×8 spray cell to GPS coordinates to drive section-control sprayers automatically.", i: MapPin },
   ];
   return (
     <Section id="future" eyebrow="Roadmap" title="Future Enhancements" sub="Planned improvements for the next generation of Green-Scanner.">
