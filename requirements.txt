@@ -8,3 +8,6 @@ torch
 torchvision
 albumentations
 scikit-learn
+fastapi
+uvicorn[standard]
+python-multipart
