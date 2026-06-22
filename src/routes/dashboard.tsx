@@ -27,224 +27,61 @@ type Result = {
   segmentedUrl: string;
 };
 
-const BASE_DOSE = 10;
-
-function morph(mask: Uint8Array, w: number, h: number, op: "erode" | "dilate", iters = 1) {
-  let src = mask;
-  for (let k = 0; k < iters; k++) {
-    const dst = new Uint8Array(src.length);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = y * w + x;
-        if (op === "erode") {
-          let v = 1;
-          for (let dy = -1; dy <= 1 && v; dy++) {
-            for (let dx = -1; dx <= 1 && v; dx++) {
-              const nx = x + dx, ny = y + dy;
-              if (nx < 0 || ny < 0 || nx >= w || ny >= h) { v = 0; break; }
-              if (!src[ny * w + nx]) v = 0;
-            }
-          }
-          dst[i] = v;
-        } else {
-          let v = 0;
-          for (let dy = -1; dy <= 1 && !v; dy++) {
-            for (let dx = -1; dx <= 1 && !v; dx++) {
-              const nx = x + dx, ny = y + dy;
-              if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-              if (src[ny * w + nx]) { v = 1; break; }
-            }
-          }
-          dst[i] = v;
-        }
-      }
-    }
-    src = dst;
-  }
-  return src;
-}
-
-function connectedComponents(mask: Uint8Array, w: number, h: number) {
-  const labels = new Int32Array(mask.length);
-  const sizes: number[] = [0];
-  let next = 1;
-  const stack: number[] = [];
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (!mask[i] || labels[i]) continue;
-      const id = next++;
-      let size = 0;
-      stack.push(i);
-      labels[i] = id;
-      while (stack.length) {
-        const p = stack.pop()!;
-        size++;
-        const px = p % w, py = (p - px) / w;
-        const ns = [
-          py > 0 ? p - w : -1,
-          py < h - 1 ? p + w : -1,
-          px > 0 ? p - 1 : -1,
-          px < w - 1 ? p + 1 : -1,
-        ];
-        for (const n of ns) {
-          if (n >= 0 && mask[n] && !labels[n]) {
-            labels[n] = id;
-            stack.push(n);
-          }
-        }
-      }
-      sizes.push(size);
-    }
-  }
-  return { labels, sizes };
-}
-
 /**
- * Faithful port of app.py's HSV segmentation pipeline.
- *
- * Pipeline (mirrors app.py exactly):
- *   1. Resize to 800x600.
- *   2. Convert RGB -> HSV (OpenCV convention: H in [0,179], S/V in [0,255]).
- *   3. Vegetation mask = inRange(HSV, [25,35,35], [95,255,255]).
- *   4. Morphological OPEN then CLOSE with a 5x5 kernel (we use two 3x3
- *      iterations to approximate a 5x5 structuring element).
- *   5. Connected components on the vegetation mask:
- *        - area >= areaThreshold  -> CROP (continuous healthy mass)
- *        - area <  areaThreshold  -> WEED (small / scattered patch)
- *   6. Soil = everything that is NOT vegetation.
- *   7. Render brown / green / red overlay blended at alpha = 0.4 over original.
- *   8. 8x8 spray grid: cell ON when weed coverage in cell > 2%.
+ * Send the uploaded image to the Python FastAPI U-Net backend
+ * (backend/main.py). All segmentation happens server-side using the
+ * trained model at backend/models/unet_crop_weed_soil.pth.
  */
+const API_URL =
+  (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ??
+  "http://localhost:8000";
+
 async function processImage(file: File): Promise<Result> {
-  const url = URL.createObjectURL(file);
-  const img = await new Promise<HTMLImageElement>((res, rej) => {
-    const i = new Image();
-    i.onload = () => res(i);
-    i.onerror = rej;
-    i.src = url;
-  });
+  const form = new FormData();
+  form.append("file", file, file.name);
 
-  // ----- Step 1: resize to 800x600 (matches app.py) -----
-  const w = 800, h = 600;
-  const c = document.createElement("canvas");
-  c.width = w; c.height = h;
-  const ctx = c.getContext("2d")!;
-  ctx.drawImage(img, 0, 0, w, h);
-  const src = ctx.getImageData(0, 0, w, h);
-  const N = w * h;
-
-  // ----- Step 2 & 3: RGB -> HSV and vegetation mask via HSV inRange -----
-  // OpenCV HSV ranges: H in [0,179], S in [0,255], V in [0,255].
-  // app.py uses lower=[25,35,35], upper=[95,255,255].
-  const H_LO = 25, H_HI = 95;
-  const S_LO = 35, V_LO = 35;
-
-  // Per-pixel green-vigor score (Excess Green) — used ONLY to break ties
-  // between crop/weed for borderline components, not to define vegetation.
-  const exg = new Float32Array(N);
-  const vegMask = new Uint8Array(N);
-
-  for (let p = 0; p < N; p++) {
-    const i = p * 4;
-    const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
-
-    // RGB -> HSV (OpenCV scale)
-    const max = Math.max(r, g, b);
-    const min = Math.min(r, g, b);
-    const d = max - min;
-    const V = max;                                // 0..255
-    const S = max === 0 ? 0 : (d * 255) / max;    // 0..255
-    let Hdeg = 0;
-    if (d !== 0) {
-      if (max === r)      Hdeg = 60 * (((g - b) / d) % 6);
-      else if (max === g) Hdeg = 60 * ((b - r) / d + 2);
-      else                Hdeg = 60 * ((r - g) / d + 4);
-      if (Hdeg < 0) Hdeg += 360;
-    }
-    const Hcv = Hdeg / 2;                         // 0..179 (OpenCV)
-
-    exg[p] = 2 * g - r - b;
-
-    if (Hcv >= H_LO && Hcv <= H_HI && S >= S_LO && V >= V_LO) vegMask[p] = 1;
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/predict`, { method: "POST", body: form });
+  } catch {
+    throw new Error(
+      `Could not reach the Python backend at ${API_URL}. Start it with:\n` +
+      `uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000`,
+    );
   }
 
-  // ----- Step 4: morphological OPEN then CLOSE -----
-  // app.py uses a 5x5 kernel; we apply two 3x3 iterations to approximate it.
-  let cleaned = morph(vegMask, w, h, "erode", 2);
-  cleaned = morph(cleaned, w, h, "dilate", 2);   // OPEN done
-  cleaned = morph(cleaned, w, h, "dilate", 2);
-  cleaned = morph(cleaned, w, h, "erode", 2);    // CLOSE done
-
-  // ----- Step 5: connected components -> crop (large) vs weed (small) -----
-  // app.py uses area_threshold = 1500 at 800x600. We use the same constant
-  // here since we render at the same resolution.
-  const AREA_THRESHOLD = 1500;
-  const { labels, sizes } = connectedComponents(cleaned, w, h);
-  const NC = sizes.length;
-
-  // 0 = soil (no component), 1 = crop, 2 = weed
-  const compClass = new Uint8Array(NC);
-  for (let id = 1; id < NC; id++) {
-    compClass[id] = sizes[id] >= AREA_THRESHOLD ? 1 : 2;
+  if (!res.ok) {
+    let detail = `Backend error (${res.status}).`;
+    try {
+      const j = await res.json();
+      if (j?.detail) detail = String(j.detail);
+    } catch { /* keep default */ }
+    throw new Error(detail);
   }
 
-  // ----- Step 6: per-pixel class assignment + render -----
-  const out = ctx.createImageData(w, h);
-  const cells = Array.from({ length: 64 }, () => ({ weed: 0, total: 0 }));
-  const cw = w / 8, ch = h / 8;
-  let crop = 0, weed = 0, soil = 0;
-  const ALPHA = 0.4; // matches app.py's cv2.addWeighted(image, 0.6, seg, 0.4)
+  const j = (await res.json()) as {
+    segmentedImage: string;
+    cropPct: number;
+    weedPct: number;
+    soilPct: number;
+    density: number;
+    dose: number;
+    saved: number;
+    grid: boolean[];
+    onCount: number;
+  };
 
-  // Touch exg so TS doesn't drop it (kept for future component tie-breaks).
-  void exg;
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const p = y * w + x;
-      const i = p * 4;
-      const r = src.data[i], g = src.data[i + 1], b = src.data[i + 2];
-
-      const id = labels[p];
-      const cls = id ? compClass[id] : 0; // 0 soil, 1 crop, 2 weed
-
-      // Overlay colors match app.py: soil [139,69,19], crop [0,255,0], weed [255,0,0]
-      let cr = 139, cg = 69, cb = 19;
-      if (cls === 1)      { cr = 0;   cg = 255; cb = 0;   crop++; }
-      else if (cls === 2) { cr = 255; cg = 0;   cb = 0;   weed++; }
-      else                {                                  soil++; }
-
-      out.data[i]     = Math.round(r * (1 - ALPHA) + cr * ALPHA);
-      out.data[i + 1] = Math.round(g * (1 - ALPHA) + cg * ALPHA);
-      out.data[i + 2] = Math.round(b * (1 - ALPHA) + cb * ALPHA);
-      out.data[i + 3] = 255;
-
-      const cx = Math.min(7, Math.floor(x / cw));
-      const cy = Math.min(7, Math.floor(y / ch));
-      const idx = cy * 8 + cx;
-      cells[idx].total++;
-      if (cls === 2) cells[idx].weed++;
-    }
-  }
-
-  ctx.putImageData(out, 0, 0);
-  const segmentedUrl = c.toDataURL("image/jpeg", 0.9);
-  URL.revokeObjectURL(url);
-
-  const total = crop + weed + soil;
-  const cropPct = (crop / total) * 100;
-  const weedPct = (weed / total) * 100;
-  const soilPct = (soil / total) * 100;
-  // app.py: density = weed_pixels / total_pixels; dose scales with that.
-  const density = weedPct;
-  const dose = +(BASE_DOSE * (weedPct / 100)).toFixed(2);
-  const saved = +(BASE_DOSE - dose).toFixed(2);
-
-  // app.py spray grid: ON when weed coverage in cell > 2%.
-  const grid = cells.map((cc) => cc.total > 0 && (cc.weed / cc.total) * 100 > 2);
-  const onCount = grid.filter(Boolean).length;
-
-  return { cropPct, weedPct, soilPct, density, dose, saved, grid, onCount, segmentedUrl };
+  return {
+    cropPct: j.cropPct,
+    weedPct: j.weedPct,
+    soilPct: j.soilPct,
+    density: j.density,
+    dose: j.dose,
+    saved: j.saved,
+    grid: j.grid,
+    onCount: j.onCount,
+    segmentedUrl: j.segmentedImage,
+  };
 }
 
 function DashboardPage() {
