@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Model files
+*.pth
+
+# Dataset and outputs
+dataset/
+outputs/
+
+# Build files
+dist/
+build/
+
+# Dependencies
+node_modules/
+
+# TanStack cache
+.tanstack/
