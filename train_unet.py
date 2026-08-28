@@ -138,7 +138,7 @@ class UNet(nn.Module):
         self.d4 = conv_block(256, 128)
         self.u3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
         self.d3 = conv_block(128, 64)
-        self.u2 = nn.ConvTransposed(64, 32, 2, stride=2)
+        self.u2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
         self.d2 = conv_block(64, 32)
         self.u1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
         self.d1 = conv_block(32, 16)

@@ -45,9 +45,10 @@ def _load_model():
     if _model is not None:
         return _model, _device
     if not os.path.exists(MODEL_PATH):
-    raise ModelNotFoundError(
-        "Model file not found at backend/models/unet_crop_weed_soil.pth"
-    )
+        raise ModelNotFoundError(
+            "Model file not found at backend/models/unet_crop_weed_soil.pth"
+        )
+
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     m = UNet(NUM_CLASSES).to(_device)
     m.load_state_dict(torch.load(MODEL_PATH, map_location=_device))
