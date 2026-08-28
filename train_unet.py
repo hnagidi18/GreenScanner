@@ -126,25 +126,24 @@ def conv_block(in_c, out_c):
 class UNet(nn.Module):
     def __init__(self, n_classes: int = NUM_CLASSES):
         super().__init__()
-        self.e1 = conv_block(3,  64)
-        self.e2 = conv_block(64, 128)
-        self.e3 = conv_block(128, 256)
-        self.e4 = conv_block(256, 512)
+        self.e1 = conv_block(3, 16)
+        self.e2 = conv_block(16, 32)
+        self.e3 = conv_block(32, 64)
+        self.e4 = conv_block(64, 128)
         self.pool = nn.MaxPool2d(2)
 
-        self.b  = conv_block(512, 1024)
+        self.b = conv_block(128, 256)
 
-        self.u4 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
-        self.d4 = conv_block(1024, 512)
-        self.u3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
-        self.d3 = conv_block(512, 256)
-        self.u2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.d2 = conv_block(256, 128)
-        self.u1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.d1 = conv_block(128, 64)
+        self.u4 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.d4 = conv_block(256, 128)
+        self.u3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.d3 = conv_block(128, 64)
+        self.u2 = nn.ConvTransposed(64, 32, 2, stride=2)
+        self.d2 = conv_block(64, 32)
+        self.u1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
+        self.d1 = conv_block(32, 16)
 
-        self.out = nn.Conv2d(64, n_classes, 1)
-
+        self.out = nn.Conv2d(16, n_classes, 1)
     def forward(self, x):
         e1 = self.e1(x)
         e2 = self.e2(self.pool(e1))
