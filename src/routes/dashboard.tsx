@@ -37,7 +37,7 @@ type Result = {
  */
 const API_URL =
   (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ??
-  "https://greensight-ai-backend.onrender.com";
+  "https://greenscanner.onrender.com";
 
 async function processImage(file: File): Promise<Result> {
   const form = new FormData();

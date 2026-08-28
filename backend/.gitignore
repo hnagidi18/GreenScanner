@@ -3,9 +3,6 @@ __pycache__/
 *.pyc
 .venv/
 
-# Model files
-*.pth
-
 # Dataset and outputs
 dataset/
 outputs/
